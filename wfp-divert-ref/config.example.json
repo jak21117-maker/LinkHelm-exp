@@ -1,0 +1,41 @@
+{
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 10808,
+  "intercept_tcp": true,
+  "intercept_udp": true,
+  "udp_session_timeout_sec": 60,
+  "apps": [
+    "discord.exe",
+    "telegram.exe",
+    "update.exe",
+    "denuvo-anti-cheat-update-service.exe"
+  ],
+  "hostnames": [
+    "ac-upd.codefusion.technology",
+    "ac-trg.codefusion.technology",
+    "ac-rep.codefusion.technology",
+    "ac-fileshare.codefusion.technology",
+    "ac-knock.codefusion.technology",
+    "ac-prp-ap.codefusion.technology",
+    "ac-survey.codefusion.technology",
+    "ac-fallback.codefusion.technology",
+    "support.codefusion.technology",
+    "srv01.codefusion.technology",
+    "srv02.codefusion.technology",
+    "srv03.codefusion.technology",
+    "embark.games",
+    "id.embark.games",
+    "embark-studios.com",
+    "es-pio.net",
+    "api-gateway.europe.es-pio.net",
+    "client2pubsub.europe.es-pio.net"
+  ],
+  "ips": [
+    "46.137.146.164/32",
+    "18.200.121.106/32",
+    "13.33.235.92/32",
+    "18.202.98.236/32"
+  ],
+  "geoip": [
+  ]
+}
