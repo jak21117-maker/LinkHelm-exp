@@ -166,14 +166,17 @@ struct TcpSession {
     std::atomic<int>* budget = nullptr;
 };
 
-void Pump(TcpSession* s, int from, const std::atomic<bool>* running) {
+void Pump(TcpSession* s, int from) {
     SOCKET src = from == 0 ? s->client : s->remote;
     SOCKET dst = from == 0 ? s->remote : s->client;
     char buf[16384];
     DWORD tmo = 1000;
     setsockopt(src, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&tmo), sizeof(tmo));
-    while (running->load()) {
+    for (;;) {
+        // Termination relies purely on socket closure (Stop closes both
+        // ends) — detached pumps never touch Impl members, so they cannot
+        // race a later ExpEngine destruction.
         int n = recv(src, buf, sizeof(buf), 0);
         if (n > 0) {
             int sent = 0;
@@ -194,11 +197,16 @@ void Pump(TcpSession* s, int from, const std::atomic<bool>* running) {
     shutdown(s->remote, SD_BOTH);
 }
 
+struct TcpRegistry {
+    std::mutex mtx;
+    std::vector<std::shared_ptr<TcpSession>> live;
+};
+
 void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
                const std::string& phone_ip, uint16_t phone_port,
                const ExpAuth& auth, std::mutex* log_mtx,
                const std::function<void(const std::wstring&)>& log,
-               const std::atomic<bool>* running, std::string* loop_err) {
+               TcpRegistry* reg, std::string* loop_err) {
     std::string err;
     s->remote = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
                                     htonl(entry.orig_dst_ip),
@@ -217,12 +225,19 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
         if (s->budget) s->budget->fetch_sub(1);
         return;
     }
-    std::thread t1(Pump, s.get(), 0, running);
-    std::thread t2(Pump, s.get(), 1, running);
+    std::thread t1(Pump, s.get(), 0);
+    std::thread t2(Pump, s.get(), 1);
     t1.join();
     t2.join();
     closesocket(s->client);
     closesocket(s->remote);
+    // deregister BEFORE the budget decrement: Stop waits for budget==0 and
+    // then may destroy the registry storage.
+    {
+        std::lock_guard<std::mutex> lk(reg->mtx);
+        for (auto it = reg->live.begin(); it != reg->live.end(); ++it)
+            if (it->get() == s.get()) { reg->live.erase(it); break; }
+    }
     if (s->budget) s->budget->fetch_sub(1);
 }
 
@@ -236,10 +251,11 @@ struct UdpSession {
     std::chrono::steady_clock::time_point last;
 };
 
-void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
-                   const std::atomic<bool>* running) {
+void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess) {
     uint8_t payload[65535];
-    while (running->load()) {
+    for (;;) {
+        // Exits when the association sockets are closed (Stop / expiry /
+        // control-conn death) — no Impl member is touched after that.
         DWORD tmo = 1500;
         setsockopt(sess->assoc.udp, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&tmo), sizeof(tmo));
@@ -328,6 +344,7 @@ struct ExpEngine::Impl {
     bool udp_warned = false;
 
     std::atomic<int> tcp_budget{0};
+    TcpRegistry tcp_reg;
     std::mutex log_mtx;
     std::string last_tcp_err;
 
@@ -381,8 +398,12 @@ void ExpEngine::Impl::AcceptLoop() {
         auto s = std::make_shared<TcpSession>();
         s->client = cs;
         s->budget = &tcp_budget;
+        {
+            std::lock_guard<std::mutex> lk(tcp_reg.mtx);
+            tcp_reg.live.push_back(s);
+        }
         std::thread(TcpWorker, s, entry, phone8, cfg.phone_port, auth,
-                    &log_mtx, log, &running, &last_tcp_err).detach();
+                    &log_mtx, log, &tcp_reg, &last_tcp_err).detach();
     }
     closesocket(listener);
     listener = INVALID_SOCKET;
@@ -460,8 +481,8 @@ void ExpEngine::Impl::MainLoop() {
                     wd.send(divert, pkt.data(), len, nullptr, &addr);
                     continue;
                 }
+                it->second.last = std::chrono::steady_clock::now();
                 entry = it->second;
-                entry.last = std::chrono::steady_clock::now();
             }
             uint32_t tmp = iph->DstAddr;
             tcph->SrcPort = htons(entry.orig_dst_port);
@@ -489,8 +510,11 @@ void ExpEngine::Impl::MainLoop() {
             {
                 std::lock_guard<std::mutex> lk(nat_mtx);
                 auto it = nat.find(key);
-                if (it != nat.end()) { entry = it->second; have = true;
-                                       entry.last = std::chrono::steady_clock::now(); }
+                if (it != nat.end()) {
+                    it->second.last = std::chrono::steady_clock::now();
+                    entry = it->second;
+                    have = true;
+                }
             }
             if (!have) {
                 bool syn = tcph->Syn && !tcph->Ack;
@@ -562,8 +586,7 @@ void ExpEngine::Impl::MainLoop() {
                 } else {
                     udp[key] = ns;
                     sess = ns;
-                    std::thread(UdpRecvThread, divert, wd, sess,
-                                &running).detach();
+                    std::thread(UdpRecvThread, divert, wd, sess).detach();
                 }
             }
             if (!ExpSocks5UdpSend(sess->assoc, dst_ip, dport,
@@ -749,7 +772,7 @@ void ExpEngine::Stop() {
         closesocket(I->listener);
         I->listener = INVALID_SOCKET;
     }
-    // close all UDP associations -> recv threads exit
+    // close all UDP associations -> recv threads exit on socket error
     {
         std::lock_guard<std::mutex> lk(I->udp_mtx);
         for (auto& kv : I->udp) ExpSocks5UdpClose(&kv.second->assoc);
@@ -759,10 +782,28 @@ void ExpEngine::Stop() {
     if (I->main_thr.joinable()) I->main_thr.join();
     if (I->accept_thr.joinable()) I->accept_thr.join();
     if (I->expire_thr.joinable()) I->expire_thr.join();
-    // detached TCP pumps exit on their next 1s recv tick once both sockets
-    // are closed; give them a moment so Impl never outlives a touching
-    // thread (sessions own no Impl state after this wait).
-    for (int i = 0; i < 30 && I->tcp_budget.load() > 0; ++i) Sleep(100);
+    // detached TCP pumps exit once both of their sockets are closed — close
+    // every live session here, then wait for the workers to deregister.
+    {
+        std::lock_guard<std::mutex> lk(I->tcp_reg.mtx);
+        for (auto& ts : I->tcp_reg.live) {
+            if (ts->client != INVALID_SOCKET) {
+                shutdown(ts->client, SD_BOTH);
+                closesocket(ts->client);
+                ts->client = INVALID_SOCKET;
+            }
+            if (ts->remote != INVALID_SOCKET) {
+                shutdown(ts->remote, SD_BOTH);
+                closesocket(ts->remote);
+                ts->remote = INVALID_SOCKET;
+            }
+        }
+    }
+    for (int i = 0; i < 50 && I->tcp_budget.load() > 0; ++i) Sleep(100);
+    {
+        std::lock_guard<std::mutex> lk(I->tcp_reg.mtx);
+        I->tcp_reg.live.clear();
+    }
     if (I->route_added) {
         DeleteIpForwardEntry(&I->route_rows[0]);
         DeleteIpForwardEntry(&I->route_rows[1]);
