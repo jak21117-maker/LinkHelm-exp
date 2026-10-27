@@ -156,6 +156,7 @@ struct NatEntry {
     uint16_t orig_dst_port = 0; // host order
     uint32_t if_idx = 0;
     uint32_t sub_if_idx = 0;
+    uint64_t flow_id = 0;       // stable trace id for structured logs
     std::chrono::steady_clock::time_point last;
 };
 
@@ -164,11 +165,18 @@ struct TcpSession {
     SOCKET client = INVALID_SOCKET;  // accepted (reflected) socket
     SOCKET remote = INVALID_SOCKET;  // SOCKS5 socket to the phone
     std::atomic<int>* budget = nullptr;
+    std::atomic<uint64_t> up{0};     // app -> phone bytes
+    std::atomic<uint64_t> down{0};   // phone -> app bytes
 };
 
+// One direction of a session. A clean EOF (peer FIN) propagates a HALF-close
+// (shutdown SD_SEND on the other side) instead of killing both directions —
+// a server that closes its upload side while still downloading must keep
+// flowing (plan §07: 半关闭不得被误当作立即清理).
 void Pump(TcpSession* s, int from) {
     SOCKET src = from == 0 ? s->client : s->remote;
     SOCKET dst = from == 0 ? s->remote : s->client;
+    auto* counter = from == 0 ? &s->up : &s->down;
     char buf[16384];
     DWORD tmo = 1000;
     setsockopt(src, SOL_SOCKET, SO_RCVTIMEO,
@@ -179,6 +187,7 @@ void Pump(TcpSession* s, int from) {
         // race a later ExpEngine destruction.
         int n = recv(src, buf, sizeof(buf), 0);
         if (n > 0) {
+            counter->fetch_add(static_cast<uint64_t>(n));
             int sent = 0;
             bool broken = false;
             while (sent < n) {
@@ -186,15 +195,20 @@ void Pump(TcpSession* s, int from) {
                 if (r <= 0) { broken = true; break; }
                 sent += r;
             }
-            if (broken) break;
+            if (broken) {
+                // hard failure in this direction: tear down BOTH ends so
+                // the sibling pump unblocks immediately
+                shutdown(s->client, SD_BOTH);
+                shutdown(s->remote, SD_BOTH);
+                break;
+            }
         } else {
             int e = WSAGetLastError();
             if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) continue;
+            if (n == 0) shutdown(dst, SD_SEND);  // clean EOF: half-close only
             break;
         }
     }
-    shutdown(s->client, SD_BOTH);
-    shutdown(s->remote, SD_BOTH);
 }
 
 struct TcpRegistry {
@@ -202,11 +216,135 @@ struct TcpRegistry {
     std::vector<std::shared_ptr<TcpSession>> live;
 };
 
+// Aggregate counters (plan §5.3: 会话闭环证据). Shared via shared_ptr so
+// detached workers can still account their last bytes safely during Stop.
+struct EngineStats {
+    std::atomic<uint64_t> bytes_up{0};
+    std::atomic<uint64_t> bytes_down{0};
+    std::atomic<uint64_t> socks_ok{0};
+    std::atomic<uint64_t> socks_fail{0};
+    std::atomic<uint64_t> dns_ok{0};
+    std::atomic<uint64_t> dns_fail{0};
+    std::atomic<uint64_t> udp_drop{0};   // fail-closed drops (QUIC etc.)
+};
+
+std::wstring HUMAN_BYTES(uint64_t b) {
+    wchar_t buf[32];
+    if (b >= 1024 * 1024)
+        swprintf(buf, 32, L"%.1fMB", (double)b / (1024 * 1024));
+    else if (b >= 1024)
+        swprintf(buf, 32, L"%.1fKB", (double)b / 1024);
+    else
+        swprintf(buf, 32, L"%lluB", (unsigned long long)b);
+    return buf;
+}
+
+// ------------------------------------------------- DNS over TCP (RFC 7766)
+// The app's UDP:53 query is relayed as a TCP DNS exchange to the SAME
+// server, through the phone's SOCKS5 CONNECT. This requires NOTHING from
+// the phone except TCP — UDP ASSOCIATE support is not needed for DNS, which
+// unblocks name resolution (and therefore NCSI "Internet access") even on
+// phones whose SOCKS5 has no UDP support (plan EXP-007).
+void DnsWorker(HANDLE divert, WD wd, std::string phone8, uint16_t phone_port,
+               ExpAuth auth, std::shared_ptr<EngineStats> stats,
+               const std::function<void(const std::wstring&)>& log,
+               std::vector<uint8_t> query, uint32_t dns_ip_net,
+               uint16_t dns_port_net, uint32_t app_ip_net,
+               uint16_t app_port_net, uint32_t if_idx, uint32_t sub_if_idx,
+               std::atomic<int>* dns_budget) {
+    dns_budget->fetch_add(1);
+    int qlen = static_cast<int>(query.size());
+    bool ok = false;
+    do {
+        if (qlen <= 0 || qlen > 4096) break;  // absurd query — drop
+        std::string err;
+        SOCKET s = ExpSocks5TcpConnect(phone8, phone_port, auth, dns_ip_net,
+                                       dns_port_net, &err);
+        if (s == INVALID_SOCKET) break;
+        // TCP DNS: 2-byte length prefix, then the message
+        std::vector<uint8_t> req(2 + query.size());
+        req[0] = static_cast<uint8_t>(qlen >> 8);
+        req[1] = static_cast<uint8_t>(qlen);
+        std::memcpy(req.data() + 2, query.data(), query.size());
+        DWORD tmo = 5000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+        bool sent = true;
+        {
+            int off = 0;
+            while (off < (int)req.size()) {
+                int n = send(s, reinterpret_cast<const char*>(req.data() + off),
+                             (int)req.size() - off, 0);
+                if (n <= 0) { sent = false; break; }
+                off += n;
+            }
+        }
+        if (!sent) { closesocket(s); break; }
+        uint8_t lenb[2];
+        int got = 0;
+        while (got < 2) {
+            int n = recv(s, reinterpret_cast<char*>(lenb + got), 2 - got, 0);
+            if (n <= 0) break;
+            got += n;
+        }
+        if (got < 2) { closesocket(s); break; }
+        int rlen = (lenb[0] << 8) | lenb[1];
+        if (rlen <= 0 || rlen > 65535) { closesocket(s); break; }
+        std::vector<uint8_t> reply((size_t)rlen);
+        got = 0;
+        while (got < rlen) {
+            int n = recv(s, reinterpret_cast<char*>(reply.data() + got),
+                         rlen - got, 0);
+            if (n <= 0) break;
+            got += n;
+        }
+        closesocket(s);
+        if (got < rlen) break;
+        // rebuild the UDP datagram: it looks like it came from the DNS
+        // server straight to the app's socket
+        size_t psz = sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) +
+                     reply.size();
+        std::vector<uint8_t> pkt(psz, 0);
+        auto* iph = reinterpret_cast<WINDIVERT_IPHDR*>(pkt.data());
+        auto* udph = reinterpret_cast<WINDIVERT_UDPHDR*>(
+            pkt.data() + sizeof(WINDIVERT_IPHDR));
+        iph->Version = 4;
+        iph->HdrLength = sizeof(WINDIVERT_IPHDR) / 4;
+        iph->Length = htons(static_cast<uint16_t>(psz));
+        iph->TTL = 64;
+        iph->Protocol = IPPROTO_UDP;
+        iph->SrcAddr = dns_ip_net;
+        iph->DstAddr = app_ip_net;
+        udph->SrcPort = dns_port_net;
+        udph->DstPort = app_port_net;
+        udph->Length = htons(static_cast<uint16_t>(
+            sizeof(WINDIVERT_UDPHDR) + reply.size()));
+        std::memcpy(pkt.data() + sizeof(WINDIVERT_IPHDR) +
+                        sizeof(WINDIVERT_UDPHDR), reply.data(), reply.size());
+        WINDIVERT_ADDRESS addr{};
+        addr.Outbound = FALSE;
+        addr.Loopback = FALSE;
+        addr.Network.IfIdx = if_idx;
+        addr.Network.SubIfIdx = sub_if_idx;
+        wd.checksums(pkt.data(), (UINT)psz, &addr, 0);
+        UINT sl = 0;
+        ok = wd.send(divert, pkt.data(), (UINT)psz, &sl, &addr) != 0;
+    } while (false);
+    if (ok) stats->dns_ok.fetch_add(1);
+    else stats->dns_fail.fetch_add(1);
+    dns_budget->fetch_sub(1);
+}
+
 void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
                const std::string& phone_ip, uint16_t phone_port,
-               const ExpAuth& auth, std::mutex* log_mtx,
+               const ExpAuth& auth, uint64_t flow_id,
                const std::function<void(const std::wstring&)>& log,
-               TcpRegistry* reg, std::string* loop_err) {
+               TcpRegistry* reg, std::shared_ptr<EngineStats> stats) {
+    auto t0 = std::chrono::steady_clock::now();
+    std::wstring dstw = IpW(htonl(entry.orig_dst_ip)) + L":" +
+                        std::to_wstring(entry.orig_dst_port);
     std::string err;
     s->remote = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
                                     htonl(entry.orig_dst_ip),
@@ -214,17 +352,19 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     if (s->remote == INVALID_SOCKET) {
         // Surface the failure to the app as an immediate disconnect (never
         // fake "connected"): the plan document's observable-failure rule.
-        {
-            std::lock_guard<std::mutex> lk(*log_mtx);
-            if (!loop_err->empty()) *loop_err = err;
-        }
-        log(L"[exp] SOCKS5 CONNECT 失败: " + FromUtf8(err) + L" → " +
-            IpW(htonl(entry.orig_dst_ip)) + L":" +
-            std::to_wstring(entry.orig_dst_port));
+        stats->socks_fail.fetch_add(1);
+        log(L"[exp] #" + std::to_wstring(flow_id) + L" SOCKS5 CONNECT 失败 (" +
+            FromUtf8(err) + L") → " + dstw);
         closesocket(s->client);
         if (s->budget) s->budget->fetch_sub(1);
         return;
     }
+    stats->socks_ok.fetch_add(1);
+    int ms = static_cast<int>(std::chrono::duration_cast<
+        std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+        .count());
+    log(L"[exp] #" + std::to_wstring(flow_id) + L" 手机已接通 → " + dstw +
+        L" (" + std::to_wstring(ms) + L"ms)");
     std::thread t1(Pump, s.get(), 0);
     std::thread t2(Pump, s.get(), 1);
     t1.join();
@@ -238,6 +378,13 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
         for (auto it = reg->live.begin(); it != reg->live.end(); ++it)
             if (it->get() == s.get()) { reg->live.erase(it); break; }
     }
+    stats->bytes_up.fetch_add(s->up.load());
+    stats->bytes_down.fetch_add(s->down.load());
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    log(L"[exp] #" + std::to_wstring(flow_id) + L" 结束 " + dstw +
+        L" ↑" + HUMAN_BYTES(s->up.load()) + L" ↓" +
+        HUMAN_BYTES(s->down.load()) + L" " + std::to_wstring(secs) + L"s");
     if (s->budget) s->budget->fetch_sub(1);
 }
 
@@ -251,7 +398,8 @@ struct UdpSession {
     std::chrono::steady_clock::time_point last;
 };
 
-void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess) {
+void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
+                   std::atomic<int>* udp_budget) {
     uint8_t payload[65535];
     for (;;) {
         // Exits when the association sockets are closed (Stop / expiry /
@@ -297,6 +445,92 @@ void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess) {
         UINT sl = 0;
         wd.send(divert, pkt.data(), (UINT)psz, &sl, &addr);
     }
+    udp_budget->fetch_sub(1);
+}
+
+// ---------------------------------------------------- DNS adapter backup
+// With Wi-Fi Direct as the ONLY uplink, the adapter often has no (or a
+// phone-gateway) DNS server. Name resolution then dies before any packet
+// is emitted — the root cause of the "路由黑洞" browser symptom. We set
+// public DNS on the phone-facing adapter for the session and restore the
+// original configuration on Stop.
+struct DnsBackup {
+    std::wstring ifname;                 // adapter friendly name
+    std::vector<std::wstring> servers;   // original DNS servers (may be empty)
+    bool changed = false;
+};
+
+bool RunNetsh(const std::wstring& args) {
+    std::wstring cmd = L"netsh.exe " + args;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(L'\0');
+    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok) return false;
+    WaitForSingleObject(pi.hProcess, 8000);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code == 0;
+}
+
+// Find the adapter that owns the phone-facing IP and back up its DNS list.
+bool BackupAdapterDns(const std::string& phone8, DnsBackup* out) {
+    ULONG sz = 16 * 1024;
+    std::vector<uint8_t> buf;
+    for (int tries = 0; tries < 3; ++tries) {
+        buf.resize(sz);
+        ULONG r = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS,
+                                       nullptr,
+                                       reinterpret_cast<IP_ADAPTER_ADDRESSES*>(
+                                           buf.data()), &sz);
+        if (r == ERROR_SUCCESS) break;
+        if (r == ERROR_BUFFER_OVERFLOW) continue;
+        return false;
+    }
+    auto* ad = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    for (; ad; ad = ad->Next) {
+        for (auto* ua = ad->FirstUnicastAddress; ua; ua = ua->Next) {
+            char ip[64] = "";
+            if (ua->Address.lpSockaddr->sa_family == AF_INET &&
+                getnameinfo(ua->Address.lpSockaddr,
+                            ua->Address.iSockaddrLength, ip, sizeof(ip),
+                            nullptr, 0, NI_NUMERICHOST) == 0 &&
+                phone8 == ip) {
+                out->ifname = std::wstring(ad->FriendlyName);
+                for (auto* ds = ad->FirstDnsServerAddress; ds;
+                     ds = ds->Next) {
+                    if (!ds->Address.lpSockaddr) continue;
+                    wchar_t w[64] = L"";
+                    sockaddr_in* a =
+                        reinterpret_cast<sockaddr_in*>(ds->Address.lpSockaddr);
+                    InetNtopW(AF_INET, &a->sin_addr, w, 64);
+                    out->servers.push_back(w);
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// A private DNS server (typically the phone/ICS gateway itself) cannot
+// reliably answer through the SOCKS5 CONNECT path — the phone would connect
+// to itself. Only a public resolver is considered usable here.
+bool HasPublicDns(const DnsBackup& b) {
+    for (const auto& s : b.servers) {
+        unsigned o1 = 0;
+        swscanf(s.c_str(), L"%u", &o1);
+        if (o1 != 10 && o1 != 127 && o1 != 172 && o1 != 192 && o1 != 169)
+            return true;
+    }
+    return false;
 }
 
 // ------------------------------------------------------------- half routes
@@ -306,6 +540,7 @@ bool AddHalfRoute(DWORD if_idx, uint32_t phone_net, uint32_t dest_net,
     r.dwForwardDest = dest_net;
     r.dwForwardMask = mask;
     r.dwForwardPolicy = 0;
+    r.dwForwardIfIndex = if_idx;     // REQUIRED: pin to the phone link
     r.dwForwardNextHop = phone_net;
     r.dwForwardType = 4;             // NlRouteTypeGateway-ish (indirect)
     r.dwForwardProto = MIB_IPPROTO_NETMGMT;
@@ -318,8 +553,32 @@ bool AddHalfRoute(DWORD if_idx, uint32_t phone_net, uint32_t dest_net,
     r.dwForwardMetric5 = (DWORD)-1;
     if (CreateIpForwardEntry(&r) != NO_ERROR) return false;
     *out = r;
-    (void)if_idx;
     return true;
+}
+
+// A hard-killed previous session can leave the 0/1+128/1 half routes behind
+// (the "路由黑洞" residue: every Internet-bound packet is sent toward the
+// dead phone link and swallowed). Sweep any NETMGMT half routes at Start —
+// re-adding our own right after is idempotent.
+void SweepStaleHalfRoutes() {
+    MIB_IPFORWARDTABLE* t = nullptr;
+    ULONG sz = 0;
+    if (GetIpForwardTable(nullptr, &sz, FALSE) == ERROR_INSUFFICIENT_BUFFER) {
+        t = reinterpret_cast<MIB_IPFORWARDTABLE*>(malloc(sz));
+        if (t && GetIpForwardTable(t, &sz, FALSE) == NO_ERROR) {
+            for (DWORD i = 0; i < t->dwNumEntries; ++i) {
+                MIB_IPFORWARDROW* r = &t->table[i];
+                bool half1 = r->dwForwardDest == 0 &&
+                             r->dwForwardMask == 0x80000000;
+                bool half2 = r->dwForwardDest == 0x80000000 &&
+                             r->dwForwardMask == 0x80000000;
+                if ((half1 || half2) &&
+                    r->dwForwardProto == MIB_IPPROTO_NETMGMT)
+                    DeleteIpForwardEntry(r);
+            }
+        }
+    }
+    free(t);
 }
 
 }  // namespace
@@ -344,9 +603,16 @@ struct ExpEngine::Impl {
     bool udp_warned = false;
 
     std::atomic<int> tcp_budget{0};
+    std::atomic<int> dns_budget{0};
+    std::atomic<int> udp_budget{0};
+    std::atomic<uint64_t> next_flow{1};
+    std::shared_ptr<EngineStats> stats{new EngineStats()};
     TcpRegistry tcp_reg;
-    std::mutex log_mtx;
-    std::string last_tcp_err;
+
+    // true when the phone link is the machine's only usable uplink — then
+    // UDP we cannot proxy must be DROPPED (fail-closed), because "pass
+    // through" means the packet rides the half-route into the black hole.
+    bool phone_only_uplink = true;
 
     ExpAuth auth;
     std::string phone8;
@@ -354,6 +620,9 @@ struct ExpEngine::Impl {
     // routes we added (and must remove on Stop)
     bool route_added = false;
     MIB_IPFORWARDROW route_rows[2]{};
+
+    // DNS adapter override (set on Start, restored on Stop)
+    DnsBackup dns_backup;
 
     std::thread main_thr, accept_thr, expire_thr;
 
@@ -398,22 +667,25 @@ void ExpEngine::Impl::AcceptLoop() {
         auto s = std::make_shared<TcpSession>();
         s->client = cs;
         s->budget = &tcp_budget;
+        uint64_t flow_id = entry.flow_id;
         {
             std::lock_guard<std::mutex> lk(tcp_reg.mtx);
             tcp_reg.live.push_back(s);
         }
         std::thread(TcpWorker, s, entry, phone8, cfg.phone_port, auth,
-                    &log_mtx, log, &tcp_reg, &last_tcp_err).detach();
+                    flow_id, log, &tcp_reg, stats).detach();
     }
     closesocket(listener);
     listener = INVALID_SOCKET;
 }
 
 void ExpEngine::Impl::ExpireLoop() {
+    int ticks = 0;
     while (running.load()) {
         for (int i = 0; i < 10 && running.load(); ++i)
             Sleep(100);
         if (!running.load()) break;
+        ++ticks;
         auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(nat_mtx);
@@ -436,6 +708,18 @@ void ExpEngine::Impl::ExpireLoop() {
             }
         }
         for (auto& s : dead) ExpSocks5UdpClose(&s->assoc);  // recv thread exits
+        // plan §5.3: aggregate session-closure evidence every ~10s
+        if (ticks % 10 == 0) {
+            log(L"[exp] 统计: TCP 活动 " +
+                std::to_wstring(tcp_budget.load()) +
+                L" | 成功 " + std::to_wstring(stats->socks_ok.load()) +
+                L" 失败 " + std::to_wstring(stats->socks_fail.load()) +
+                L" | ↑" + HUMAN_BYTES(stats->bytes_up.load()) +
+                L" ↓" + HUMAN_BYTES(stats->bytes_down.load()) +
+                L" | DNS 成功 " + std::to_wstring(stats->dns_ok.load()) +
+                L" 失败 " + std::to_wstring(stats->dns_fail.load()) +
+                L" | UDP 丢弃 " + std::to_wstring(stats->udp_drop.load()));
+        }
     }
 }
 
@@ -497,6 +781,28 @@ void ExpEngine::Impl::MainLoop() {
             continue;
         }
 
+        // ---- DNS (UDP:53) BEFORE the LAN bypass: with Wi-Fi Direct as the
+        // only uplink, the system resolver targets the phone gateway or has
+        // no server at all. Relay every query over TCP through the phone's
+        // SOCKS5 (DNS-over-TCP, RFC 7766) — no UDP ASSOCIATE needed.
+        if (udph && ntohs(dport) == 53 && data && dlen > 0) {
+            // vector is copied into the thread — the packet buffer itself
+            // must never be referenced after MainLoop moves on
+            std::vector<uint8_t> q(static_cast<const uint8_t*>(data),
+                                   static_cast<const uint8_t*>(data) + dlen);
+            std::atomic<int>* db = &dns_budget;
+            auto st = stats;
+            auto logfn = log;
+            std::string ph = phone8;
+            uint16_t pp = cfg.phone_port;
+            ExpAuth au = auth;
+            std::thread(DnsWorker, divert, wd, ph, pp, au, st, logfn,
+                        q, dst_ip, dport, iph->SrcAddr,
+                        sport, addr.Network.IfIdx, addr.Network.SubIfIdx, db)
+                .detach();
+            continue;  // captured packet consumed; reply is synthesized
+        }
+
         // ---- policy: never capture LAN/multicast/broadcast ----
         if (IsBypassDst(dst_ip)) {
             wd.send(divert, pkt.data(), len, nullptr, &addr);
@@ -526,10 +832,15 @@ void ExpEngine::Impl::MainLoop() {
                 entry.orig_dst_port = ntohs(dport);
                 entry.if_idx = addr.Network.IfIdx;
                 entry.sub_if_idx = addr.Network.SubIfIdx;
+                entry.flow_id = next_flow.fetch_add(1);
                 entry.last = std::chrono::steady_clock::now();
-                std::lock_guard<std::mutex> lk(nat_mtx);
-                nat[key] = entry;
-                log(L"[exp] TCP " + IpW(iph->SrcAddr) + L":" +
+                uint64_t flow_id = entry.flow_id;
+                {
+                    std::lock_guard<std::mutex> lk(nat_mtx);
+                    nat[key] = entry;
+                }
+                log(L"[exp] #" + std::to_wstring(flow_id) + L" 捕获 TCP " +
+                    IpW(iph->SrcAddr) + L":" +
                     std::to_wstring(ntohs(sport)) + L" → " +
                     IpW(dst_ip) + L":" + std::to_wstring(ntohs(dport)));
             }
@@ -547,6 +858,13 @@ void ExpEngine::Impl::MainLoop() {
         }
 
         if (udph && data && dlen > 0) {
+            // QUIC / HTTP-3: most SOCKS5 servers (incl. the phone) cannot
+            // carry it, and on a phone-only uplink "pass through" = black
+            // hole. Drop it so the browser falls back to TCP immediately.
+            if (ntohs(dport) == 443) {
+                stats->udp_drop.fetch_add(1);
+                continue;
+            }
             uint64_t key = (static_cast<uint64_t>(ntohl(iph->SrcAddr)) << 16) |
                            ntohs(sport);
             std::shared_ptr<UdpSession> sess;
@@ -573,27 +891,38 @@ void ExpEngine::Impl::MainLoop() {
                     if (!udp_warned) {
                         udp_warned = true;
                         log(L"[exp] UDP ASSOCIATE 失败: " + FromUtf8(err) +
-                            L" — UDP 将保持直连放行（fail-open）");
+                            (phone_only_uplink
+                                 ? L" — 本机仅手机链路，UDP 已 fail-closed 丢弃"
+                                 : L" — 存在其它上行，UDP 保持直连放行"));
                     }
-                    wd.send(divert, pkt.data(), len, nullptr, &addr);
+                    stats->udp_drop.fetch_add(1);
+                    if (!phone_only_uplink)
+                        wd.send(divert, pkt.data(), len, nullptr, &addr);
+                    // fail-closed on the phone-only uplink: never feed the
+                    // black hole
                     continue;
                 }
+                udp_budget.fetch_add(1);
                 std::lock_guard<std::mutex> lk(udp_mtx);
                 auto it = udp.find(key);
                 if (it != udp.end()) {  // raced: another thread won
                     ExpSocks5UdpClose(&ns->assoc);
+                    udp_budget.fetch_sub(1);
                     sess = it->second;
                 } else {
                     udp[key] = ns;
                     sess = ns;
-                    std::thread(UdpRecvThread, divert, wd, sess).detach();
+                    std::thread(UdpRecvThread, divert, wd, sess,
+                                &udp_budget).detach();
                 }
             }
             if (!ExpSocks5UdpSend(sess->assoc, dst_ip, dport,
                                   static_cast<const uint8_t*>(data),
                                   static_cast<int>(dlen))) {
-                // fail-open on transient send failure
-                wd.send(divert, pkt.data(), len, nullptr, &addr);
+                stats->udp_drop.fetch_add(1);
+                if (!phone_only_uplink)  // transient failure: fail-open only
+                    wd.send(divert, pkt.data(), len, nullptr, &addr);
+                // with a phone-only uplink there is nowhere to send it
             }
             // captured packet is NOT reinjected outbound — it travels via
             // the SOCKS5 relay now
@@ -644,6 +973,33 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     I->log(L"[exp] SOCKS5 认证通过 " + cfg.phone_ip + L":" +
            std::to_wstring(cfg.phone_port));
 
+    // --- G0 gate (plan §11): verify the phone can actually REACH the
+    // Internet — a full SOCKS5 CONNECT through the phone to a public DNS
+    // endpoint. Auth alone proves nothing about egress. If this fails,
+    // WinDivert capture would only create a soft black hole.
+    I->status(L"验证手机出口连通（G0）…");
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        std::string gerr;
+        uint32_t dns_ip = IpToNet("223.5.5.5");
+        SOCKET g = ExpSocks5TcpConnect(
+            I->phone8, static_cast<uint16_t>(cfg.phone_port), I->auth,
+            dns_ip, htons(53), &gerr);
+        if (g == INVALID_SOCKET) {
+            if (error)
+                *error = L"G0 出口验证失败：手机无法经 SOCKS5 访问公网 (" +
+                         FromUtf8(gerr) +
+                         L")。请先确认手机数据/上行走廊正常，再启动透明代理。";
+            return false;
+        }
+        closesocket(g);
+        int ms = static_cast<int>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
+        I->log(L"[exp] G0 出口验证通过（CONNECT 223.5.5.5:53, " +
+               std::to_wstring(ms) + L"ms）— 手机可出公网");
+    }
+
     // --- ROUTE-00 gate: WinDivert can only capture packets that Windows
     // actually routes. Without any default route, Internet-bound packets
     // are dropped BEFORE the NETWORK layer and nothing can be transparent.
@@ -653,17 +1009,22 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     // capture path, so the REAL Wi-Fi adapter shows Internet access.
     I->route_added = false;
     {
-        PMIB_IPFORWARDROW pr = nullptr;
         MIB_IPFORWARDROW phone_row{};
         uint32_t phone_net = IpToNet(I->phone8);
         if (GetBestRoute(phone_net, 0, &phone_row) == NO_ERROR) {
+            // phone-only-uplink detection decides UDP fail-closed semantics
             MIB_IPFORWARDROW inet_row{};
             uint32_t probe = htonl(0x01010101);  // 1.1.1.1
-            if (GetBestRoute(probe, 0, &inet_row) != NO_ERROR ||
-                inet_row.dwForwardIfIndex != phone_row.dwForwardIfIndex) {
-                // Internet traffic does not ride the phone link — add the
-                // two half routes so packets exist (and NCSI passes on the
-                // real adapter).
+            DWORD e = GetBestRoute(probe, 0, &inet_row);
+            I->phone_only_uplink =
+                (e != NO_ERROR) ||
+                (inet_row.dwForwardIfIndex == phone_row.dwForwardIfIndex);
+            if (I->phone_only_uplink) {
+                I->log(L"[exp] 检测到本机仅手机链路可用作上行 — UDP 将按 "
+                       L"fail-closed 处理（QUIC 丢弃，浏览器自动回退 TCP）");
+                // a hard-killed previous session may have left the half
+                // routes behind — sweep them before re-adding
+                SweepStaleHalfRoutes();
                 bool ok1 = AddHalfRoute(phone_row.dwForwardIfIndex,
                                         phone_net, 0, htonl(0x80000000),
                                         &I->route_rows[0]);
@@ -672,13 +1033,14 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
                                         htonl(0x80000000), &I->route_rows[1]);
                 I->route_added = ok1 && ok2;
                 I->log(ok1 && ok2
-                    ? L"[exp] 无默认路由经手机链路 — 已加 0.0.0.0/1 + 128.0.0.0/1 经 " +
-                          cfg.phone_ip + L"（断开时自动移除）"
+                    ? L"[exp] 已加 0.0.0.0/1 + 128.0.0.0/1 经 " +
+                          cfg.phone_ip + L"（外网包可达，断开时自动移除）"
                     : L"[exp] 半默认路由添加失败（err " +
                           std::to_wstring(GetLastError()) +
                           L"）— 若系统无默认路由，外网流量将无法被截获");
             } else {
-                I->log(L"[exp] 默认路由已经由手机链路 — 无需添加路由");
+                I->log(L"[exp] 本机存在其它默认上行 — 不添加路由，仅代理经"
+                       L"手机链路的流量");
             }
         } else {
             I->log(L"[exp] 找不到到手机的路由 — 请先连接 Wi-Fi Direct");
@@ -686,6 +1048,26 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
                                 L" 的路由（Wi-Fi Direct 未连接？）";
             return false;
         }
+    }
+
+    // --- DNS adapter override: name resolution must WORK for browsing and
+    // for NCSI to flip the real Wi-Fi adapter to "Internet access". If the
+    // phone-facing adapter has no usable DNS server (typical for a bare
+    // Wi-Fi Direct network), point it at public DNS for the session and
+    // restore the original values on Stop.
+    if (BackupAdapterDns(I->phone8, &I->dns_backup) &&
+        !HasPublicDns(I->dns_backup)) {
+        std::wstring name = L"\"" + I->dns_backup.ifname + L"\"";
+        bool ok = RunNetsh(L"interface ip set dns name=" + name +
+                           L" static 223.5.5.5 primary") &&
+                  RunNetsh(L"interface ip add dns name=" + name +
+                           L" 114.114.114.114 index=2");
+        I->dns_backup.changed = ok;
+        I->log(ok
+            ? L"[exp] 适配器「" + I->dns_backup.ifname +
+                  L"」无 DNS — 已临时设置 223.5.5.5/114.114.114.114（断开恢复）"
+            : L"[exp] 适配器「" + I->dns_backup.ifname +
+                  L"」无 DNS 且设置失败 — 域名解析可能不可用");
     }
 
     // --- local TCP listener (reflection target) ---
@@ -803,6 +1185,26 @@ void ExpEngine::Stop() {
     {
         std::lock_guard<std::mutex> lk(I->tcp_reg.mtx);
         I->tcp_reg.live.clear();
+    }
+    // detached DNS workers and UDP recv threads hold only copied state +
+    // shared_ptr stats; wait for them to drain before FreeLibrary
+    for (int i = 0; i < 50 && I->dns_budget.load() > 0; ++i) Sleep(100);
+    for (int i = 0; i < 50 && I->udp_budget.load() > 0; ++i) Sleep(100);
+    // restore the adapter DNS configuration we overrode on Start
+    if (I->dns_backup.changed) {
+        std::wstring name = L"\"" + I->dns_backup.ifname + L"\"";
+        if (I->dns_backup.servers.empty()) {
+            RunNetsh(L"interface ip set dns name=" + name + L" source=dhcp");
+        } else {
+            RunNetsh(L"interface ip set dns name=" + name + L" static " +
+                     I->dns_backup.servers[0] + L" primary");
+            for (size_t k = 1; k < I->dns_backup.servers.size(); ++k)
+                RunNetsh(L"interface ip add dns name=" + name + L" " +
+                         I->dns_backup.servers[k] + L" index=" +
+                         std::to_wstring(k + 1));
+        }
+        I->dns_backup.changed = false;
+        I->log(L"[exp] 适配器 DNS 已恢复原状");
     }
     if (I->route_added) {
         DeleteIpForwardEntry(&I->route_rows[0]);

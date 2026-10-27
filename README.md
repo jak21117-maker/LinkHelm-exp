@@ -91,3 +91,24 @@ wfp-divert-ref/      wfp-divert 源码快照（MIT，学习参考）
 windivert/           WinDivert 头文件与运行件
 docs/                架构文档（本 README 即 docs/ARCHITECTURE 摘要）
 ```
+
+## Changelog
+
+### beta0.1.1 — 路由黑洞与 DNS 专项修复（对照《下一阶段优化与透明代理工程路线》G0-G3）
+
+- **G0 出口预检**：启动时先经手机 SOCKS5 做一次真实 CONNECT（223.5.5.5:53），
+  手机不能出公网则拒绝启动捕获，杜绝"只抓包不通"的软黑洞。
+- **DNS-over-TCP 中继**：UDP 53 查询经 SOCKS5 CONNECT 以 TCP DNS（RFC 7766）
+  中继到原 DNS 服务器，**不依赖手机 UDP ASSOCIATE**；适配器无可用公网 DNS 时
+  临时设置 223.5.5.5/114.114.114.114（断开自动恢复）。NCSI 探测随之打通，
+  实际 Wi-Fi 适配器可显示"Internet 访问"。
+- **QUIC/UDP fail-closed**：仅手机上行时，UDP 443（QUIC）直接丢弃（浏览器秒回
+  退 TCP），其余 UDP 在 ASSOCIATE 失败时丢弃而非放行进黑洞；存在其它上行时
+  保持 fail-open。
+- **路由黑洞清扫**：启动时删除强杀残留的 NETMGMT 0/1+128/1 半路由；
+  AddHalfRoute 修复缺失 dwForwardIfIndex 的 bug。
+- **半关闭修复**：TCP 泵一端 FIN 只 shutdown(SD_SEND) 对端，不再误杀反向数据。
+- **结构化会话日志**：#flow_id 捕获→手机接通(ms)→结束(↑/↓字节, 时长)；
+  每 10s 聚合统计（TCP 成功/失败、DNS 成功/失败、UDP 丢弃、总字节）。
+
+### beta0.1.0
