@@ -1,0 +1,77 @@
+=== LinkHelm-exp beta0.1.4 self-test (mock phone) ===
+sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
+
+[PASS] SOCKS5 RFC1929 auth precheck                         
+[PASS] wrong password is rejected                           username/password rejected by phone
+[PASS] host resolves an IPv4 address                        
+[PASS] SOCKS5 TCP CONNECT to real HTTP host                 
+[PASS] HTTP response arrives through SOCKS5 tunnel          HTTP/1.0 200 OK
+[PASS] local DNS proxy binds 127.0.0.1:15353                
+[PASS] DNS A query relayed over SOCKS5 (real engine code)   answer count=1
+[PASS] AAAA suppressed (NOERROR + 0 answers)                len=33
+[PASS] SOCKS5 UDP ASSOCIATE succeeds                        
+[PASS] UDP datagram sent through ASSOCIATE                  
+[PASS] UDP reply carries ORIGINAL remote endpoint           src_ip=8... port=9999
+[PASS] local reflection socket pair created                 
+[PASS] TcpWorker pump: request+response through phone       HTTP/1.0 200 OK
+[PASS] TcpWorker reports CONNECT success                    
+[PASS] F03 success path deregisters (live=0, budget=0)      
+    ... F03 forced REP=0x05 failures: 20/100
+    ... F03 forced REP=0x05 failures: 40/100
+    ... F03 forced REP=0x05 failures: 60/100
+    ... F03 forced REP=0x05 failures: 80/100
+    ... F03 forced REP=0x05 failures: 100/100
+[PASS] F03 100 forced REP=0x05 failures all counted         fail=100
+[PASS] F03 registry empty after 100 failures (was the leak) live=0
+[PASS] F03 budget back to 0 after 100 failures              budget=0
+[PASS] F04 grants slots up to the cap                       
+[PASS] F04 saturated gate REFUSES (no 25th CONNECT to the phone) 
+[PASS] F04 refusal waits out the timeout                    261ms
+[PASS] F04 a released slot is reusable                      
+[PASS] F04 Stop() wakes a queued handshake immediately      154ms
+[PASS] F02 failed injection counted (attempt=1 fail=1)      
+[PASS] F02 successful injection counted (ok=1)              
+[PASS] F01 UDP session is INITIALIZING while the phone handshakes 
+[PASS] F01 new TCP completes while UDP ASSOCIATE is still pending 19ms
+[PASS] F01 session becomes READY after the slow handshake   1074ms
+[PASS] F01 queued first datagrams flushed in order after READY sent=3
+[PASS] F01 recv thread ran (stub WD)                        
+[PASS] §5.1 phone-as-DNS remapped to public resolver       
+[PASS] §5.1 private DNS remapped to public resolver        
+[PASS] §5.1 public DNS target kept unchanged               
+[PASS] §6 dead pooled DNS link: redial once, query still succeeds ok=1 fail=0
+[PASS] §6 dead pooled link accounted                       reuse_fail=1
+[PASS] §6 redial accounted                                 redial=1
+[PASS] §6 client receives the DNS answer after redial      bytes=49
+[PASS] §6 same flow reuses its own NAT entry               
+[PASS] §6 different app_ip on same NAT key REFUSED (no flow splice) 
+[PASS] §6 different dst port on same NAT key REFUSED       
+[PASS] §4.5 UDP/443 policy is explicit (no silent global drop) 
+[PASS] §4.4 legacy virtual adapter detection is read-only & stable detected, not modified
+[PASS] F05 RUNNING vs FAULTED are distinct engine states    
+[PASS] LAN 192.168.49.1 exempt                              
+[PASS] LAN 10.0.0.1 exempt                                  
+[PASS] public 8.8.8.8 NOT exempt                            
+[PASS] IPv6 fe80::/10 link-local exempt                     
+[PASS] IPv6 ff00::/8 multicast exempt                       
+[PASS] IPv6 2001:... global unicast blocked                 
+[PASS] A query not AAAA-suppressed                          
+[PASS] AAAA query detected                                  
+[PASS] empty DNS reply keeps question, 0 answers            
+[PASS] NAT key {dst_ip,src_port} ordering                   
+[PASS] WinDivert.dll loads (helper API, no driver)          
+[PASS] WinDivert filter helper exports present              
+[PASS] beta0.1.3 filter (with IPv6) compiles                OK
+[probe] outbound                                 IPv6 packet = TRUE
+[probe] ipv6                                     IPv6 packet = TRUE
+[probe] outbound and ipv6                        IPv6 packet = TRUE
+[probe] outbound and !loopback and ipv6          IPv6 packet = TRUE
+[probe] ip                                       IPv6 packet = FALSE
+[probe] tcp                                      IPv6 packet = TRUE
+[PASS] new filter CAPTURES global IPv6 egress               
+[PASS] old filter MISSED IPv6 (confirms leak root cause)    
+[PASS] new filter CAPTURES public IPv4 TCP                  
+[PASS] phone SOCKS5 endpoint excluded (no proxy loop)       
+[INFO] WinDivertOpen err=5 (no elevation here); driver-layer injection must be verified on the target PC. Not counted as a test failure.
+
+=== RESULT: 60 passed, 0 failed ===

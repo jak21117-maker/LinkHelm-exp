@@ -36,20 +36,20 @@ TCP 反射方案参考 okatodev/wfp-divert（MIT，源码快照在 `wfp-divert-r
 1. SOCKS5 客户端实现 **method=0x02 用户名/密码认证**（wfp-divert 只有 0x00）；
 2. UDP ASSOCIATE 握手**不持全局锁**（慢握手不阻塞其它 UDP 流）；
 3. 每个 UDP 回包**校验中继端点**，FRAG≠0 直接丢弃（不静默损坏）；
-4. 代理失败**fail-open 原样放行**并记录日志，绝不静默吞包。
+4. 代理失败 **fail-closed 丢弃**并计数/记日志，绝不原样放行（0.1.2 的
+   fail-open 正是出口 IP 跳动的来源）。
 
-## ROUTE-00 关卡（路由黑洞处理）
+## 路由策略（不修改路由表）
 
-WinDivert 在 NETWORK 层只能截获 Windows **实际发出的**包。若系统没有任何
-可达外网的路由，连接在更早阶段就失败，无包可截。引擎 Start 时：
+**beta0.1.3 起引擎完全不碰系统路由表。** 0.1.2 曾尝试添加
+`0.0.0.0/1 + 128.0.0.0/1` 半路由，实测日志为「半默认路由添加失败 err 0」，
+但 WinDivert 仍捕获到 30+ 条 TCP —— 说明本机已有可用路由，半路由既无必要，
+又会在强杀后残留、制造真正的路由黑洞。
 
-- 用 `GetBestRoute` 检查到手机的路由与到 1.1.1.1 的路由是否同接口；
-- 不同（即外网流量不经手机链路）→ 添加 `0.0.0.0/1 + 128.0.0.0/1` 经手机
-  IP（仅两条半路由，**不碰真正的默认路由条目**），Stop 时精确删除；
-- 相同 → 不做任何路由变更。
-
-由此 NCSI（msftconnecttest）探测同样被截获并经手机出站，真实 Wi-Fi Direct
-适配器将显示"Internet 访问"。
+Start 时只做**只读诊断**：`GetBestRoute` 比较手机链路与 1.1.1.1 的出口接口，
+输出 `ENGINE_ROUTE_SNAPSHOT`（含是否检测到 `LinkHelm-IwIP` / Wintun 等旧虚拟
+适配器，附 `ENGINE_BASELINE_WARN`）。EXP **不会**禁用、改名或重路由任何网卡。
+公网 TCP/UDP 全部由 WinDivert NETWORK 层接管，NCSI 探测同走捕获路径。
 
 ## 构建
 
@@ -76,11 +76,18 @@ engine/linkhelm_ics.exe  ICS 共享模块（与主线同一构建）
 
 ## 实验边界（如实声明）
 
-- IPv6 不在本期范围（过滤器只匹配 IPv4；IPv6 流量原样放行）；
-- IP 分片报文（非首片）无法匹配 NAT 表，将原样直发（LAN MTU 1500 下罕见）；
-- 每条 TCP 连接 2 个泵线程（wfp-divert 同款），并发上限 400，IOCP 化留待后续；
-- 已知理论竞态：app 端口复用导致的 NAT 键碰撞概率极低，接受（同 wfp-divert）；
-- 多设备网关（FORWARD+NAT）按方案文档为独立专题（G6），不在本仓库承诺。
+- **驱动层未在本机实测**：`WinDivertOpen` 在开发机返回 `err=5`（无管理员权限），
+  所以 NETWORK 层真实捕获与回注注入只能由使用者在管理员权限下验证。自测覆盖
+  的是驱动上下游全部产品代码（用 WinDivert 自带无驱动 helper 校验过滤器语义）。
+- IPv6 全局单播出站 **显式阻断并计数**（手机 SOCKS5 无 IPv6 能力）；本地
+  link-local / multicast 放行。DNS 代理对 AAAA 返回 NOERROR 空答案。
+- UDP:443 自 beta0.1.4 起**不再无条件丢弃**，交给 UDP ASSOCIATE 转发；
+  手机不支持时由 fail-closed 路径丢弃并计数（游戏 QUIC 需求可观测）。
+- NAT 键碰撞（不同本机地址/目的端口复用同一 `{dst_ip, src_port}`）**拒绝复用
+  并计数**，不再静默拼接两条流；陈旧映射（>60s）自动回收。
+- IP 分片报文（非首片）无法匹配 NAT 表，按策略丢弃（LAN MTU 1500 下罕见）。
+- 每条 TCP 连接 2 个泵线程（wfp-divert 同款），并发闸门上限 24，IOCP 化留待后续。
+- 多设备网关（FORWARD+NAT）按方案文档为独立专题，不在本仓库承诺。
 
 ## 目录
 
@@ -93,6 +100,85 @@ docs/                架构文档（本 README 即 docs/ARCHITECTURE 摘要）
 ```
 
 ## Changelog
+
+### beta0.1.4 — 按《beta0.1.3 源码诊断与修复方案》一次性修复 F01–F05 及 §4.5/§6/§7
+
+**对照文档逐项落地（60 项模拟手机自测全部通过，EXIT=0）**
+
+| 项 | 修复 | 自测证据 |
+| --- | --- | --- |
+| F01 | UDP ASSOCIATE 移出抓包线程：会话 `INITIALIZING/READY/FAILED` + 有界首包队列 + 握手中转 worker，失败退避 | 手机握手延迟 1s 时新 TCP CONNECT 仅 16ms 完成；3 个排队首包在 READY 后按序发出 |
+| F02 | 统一 `WdInject()` 校验 `BOOL` 与 `sent == len`，记录 `inject_attempt/ok/fail`，低频带 flow_id/err/方向/IfIdx 日志 | 失败与成功注入各一项断言；10s 统计行与 `ENGINE_STOP` 汇总输出计数 |
+| F03 | 统一 `SessionFinalize()`（幂等），成功/失败/闸门超时/Stop 都经同一出口，原子句柄所有权 `CloseOnce()` | 强制 100 次 `REP=0x05` 后 `live=0`、`budget=0` |
+| F04 | `ConnectGate` 真限流：无名额**不发起 CONNECT**，超时计 `gate_timeout`；`condition_variable` 等待可被 Stop 唤醒 | 饱和闸门拒绝第 3 个（262ms）；Stop 唤醒排队者 154ms |
+| F05 | `STARTING/RUNNING/FAULTED/STOPPED` 状态机 + `SetFault()` 回调 UI；`WinDivertRecv` 失败置 FAULTED 并唤醒闸门 | `RUNNING` 与 `FAULTED` 状态名互异断言 |
+| §5.1 | WinDivert DNS 兜底把手机网关/私网 DNS 重映射到公网解析器（223.5.5.5），回包仍以原目标为源 | 3 项上游选择断言 |
+| §5.3 | 记录原 DNS 模式（DHCP/静态）与服务器顺序；`netsh` 超时强制 `TerminateProcess`，Stop 按原语义恢复 | 引擎恢复逻辑单例化 |
+| §6 | DNS 连接池死链首次复用失败 → 关闭、重拨一次、原查询重试；NAT 键碰撞拒绝复用并计数 | 死链场景 `dns_ok=1 / reuse_fail=1 / redial_ok=1`，客户端收到应答 |
+| §4.5 | UDP:443 不再静默全局丢弃，改交 UDP ASSOCIATE（失败则 fail-closed 并计数） | 策略谓词断言 |
+| §7 | `ENGINE_START/RUNNING/FAULT/STOP`、`ENGINE_ROUTE_SNAPSHOT`（含旧虚拟适配器只读告警）、`ENGINE_BASELINE_WARN`、每 10s 聚合指标、最终统计 | 旧适配器检测确定性断言（本机实测「检测到，未改动」） |
+
+**测试说明**：`tests/exp_selftest.cpp` 直接 `#include` 产品 `exp_engine.cpp`，
+测的是发布版同一份源码；内嵌模拟手机（RFC1929 / CONNECT / UDP ASSOCIATE /
+DNS-over-TCP）。修正了自测里用真实 `connect(127.0.0.1:1)` 模拟拒绝导致每次约
+1s、100 次串行看似「卡死」的问题——改为手机直接回 `REP=0x05`。
+
+**仍未验证**：`WinDivertOpen` 在开发机返回 `err=5`（无管理员权限），NETWORK 层
+真实捕获/注入必须在使用者机器上以管理员权限验收；Android Host 的真实 UDP
+ASSOCIATE 公网回包能力同样不在本机自测范围内。
+
+### beta0.1.3 — 真正的全量代理（消除出口 IP 跳动）+ 本机模拟手机实测
+
+**根因（本机实测 + WinDivert 求值器实证）**：0.1.2 只代理了一部分流量，
+不是"代理没通"。本机有两条默认路由（`WLAN → 192.168.49.1` metric 0、
+`LinkHelm-IwIP → 10.0.0.1` metric 1）且 `curl --noproxy` 直连百度返回 200，
+所以任何未被捕获的流量都会直连成功 → 出口 IP 在手机与本机网络之间跳。
+0.1.2 的 filter 是 `... and (tcp or udp)`（隐含只匹配 IPv4），
+**每一个 IPv6 包都绕过引擎直连**；`WinDivertHelperEvalFilter` 实测：
+旧 filter 对 IPv6 包 = FALSE，新 filter = TRUE。
+
+- **删除 /1 半路由**：0.1.2 日志实证 `半默认路由添加失败（err 0）`，
+  但 WinDivert 仍捕获 30+ TCP → 半路由既不必要又污染路由表。
+  beta0.1.3 **完全不修改系统路由表**，只做只读诊断（打印出口/手机链路 ifIndex）。
+- **全量接管 / fail-closed**：filter 纳入 `ipv6`；公网 IPv6 出站丢弃 +
+  本地 DNS 代理抑制 AAAA（NOERROR + 0 answers）迫使回退 IPv4；
+  "未捕获到 SYN 的存量连接"由放行改为丢弃；删除 UDP 所有 fail-open 放行分支。
+  每 10s 统计新增 `未代理泄漏（应为 0）`，可自行验证是否真正全量。
+- **消除 IP 跳动**：`NatEntry` 记录首包 `app_ip`，反射与回包注入全部固定到该地址，
+  不再用 `iph->SrcAddr`（listener 绑 `INADDR_ANY`，双默认路由下会漂到 10.0.0.2）。
+- **SOCKS5 并发闸门**（上限 24）：0.1.2 瞬间 30+ CONNECT 打爆手机 ProxyServer
+  （日志 `REP=0x5`、3109/5137ms），而反射握手已先告诉应用"已连接" →
+  5s 后断开，即"接通立马就结束"。
+- **Stop 不再早退**：DNS 改写发生在 `running=true` 之前，启动中途失败时
+  0.1.2 会永久留下指向 127.0.0.1:53 的死 DNS。现在任何情况下都执行幂等清理。
+
+**本机模拟手机实测（31/31 通过，`tests/exp_selftest.cpp`）**：
+测试程序直接 `#include src/exp_engine.cpp`，测的是发布版同一份源码；
+内嵌模拟 LinkHelm Host（RFC1929 认证 / CONNECT / UDP ASSOCIATE / DNS-over-TCP）。
+覆盖：SOCKS5 认证与错误密码拒绝、真实 HTTP 往返（HTTP/1.0 200 OK）、
+本地 DNS 代理 A 查询中继、AAAA 抑制、UDP ASSOCIATE 双向回包与源端点恢复、
+**产品 `TcpWorker` 会话泵真实 HTTP 往返**、全量策略纯逻辑、
+WinDivert filter 编译与逐包求值（新 filter 捕获 IPv6 / 旧 filter 漏 IPv6 /
+手机端点排除防循环）。
+
+**未覆盖（必须真机验证）**：`WinDivertOpen` 在本机返回 `err=5`
+（ERROR_ACCESS_DENIED，无管理员权限），因此 **驱动层的包捕获与回包注入
+未在本机实测**。请以管理员身份运行，并按 README 的验收清单核对日志。
+
+### beta0.1.2 — DNS 彻底修复（本地 DNS 代理 + 适配器识别修正）
+
+- **根因定位**：Wi-Fi Direct 由手机 DHCP 下发的 DNS 服务器即手机自身
+  （192.168.49.1），但手机是 SOCKS5 代理而非 DNS 解析器。旧版 `BackupAdapterDns`
+  按"网卡自身 unicast IP"匹配适配器，永远匹配不到手机网关，导致 DNS 从未被改写、
+  查询被 `IsBypassDst`（192.168/16）放行直连手机后被丢弃 →
+  `DNS_PROBE_FINISHED_BAD_CONFIG`、NCSI 显示"无法访问 Internet"。
+- **本地 DNS 代理（中间层）**：新增进程内 UDP DNS 服务器 `127.0.0.1:53`，把手机
+  适配器 DNS 指向回环；每个查询经 SOCKS5（TCP DNS，RFC 7766）中继到公网解析器
+  （223.5.5.5，8.8.8.8 兜底），并维护 SOCKS5 连接池摊薄 CONNECT 开销。回环流量
+  不被 WinDivert 捕获，彻底消除注入竞态，不依赖手机提供 DNS。
+- **适配器识别修正**：`BackupAdapterDns` 改为按"默认网关 == 手机 IP"匹配，确保
+  DNS 改写与断开恢复作用在正确的适配器上。
+- **保留**：TCP 反射与 UDP ASSOCIATE（实测均可用）；版本串统一升至 beta0.1.2。
 
 ### beta0.1.1 — 路由黑洞与 DNS 专项修复（对照《下一阶段优化与透明代理工程路线》G0-G3）
 
