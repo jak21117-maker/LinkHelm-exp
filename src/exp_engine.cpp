@@ -23,6 +23,7 @@
 #include <cwctype>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -31,6 +32,18 @@
 #include <iphlpapi.h>
 #include <windows.h>
 #include "windivert.h"
+
+// SIO_KEEPALIVE_VALS is declared in mstcpip.h, which is not present in every
+// MinGW-w64 sysroot. Define the ioctl locally (same layout as WinDivert-
+// based relays and ProxyBridge pb_relay.c:711-718).
+#ifndef SIO_KEEPALIVE_VALS
+#define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
+#endif
+struct TcpKeepaliveVals {
+    ULONG onoff;
+    ULONG keepalivetime;
+    ULONG keepaliveinterval;
+};
 
 namespace linkhelm {
 
@@ -213,6 +226,11 @@ struct NatEntry {
     uint32_t sub_if_idx = 0;
     uint64_t flow_id = 0;       // stable trace id for structured logs
     std::chrono::steady_clock::time_point last;
+    // ProxyBridge connection_fin(): after a FIN the mapping must survive the
+    // trailing ACK/FIN handshake but must NOT linger for minutes. A retired
+    // entry is removed by ExpireLoop a few seconds later.
+    std::chrono::steady_clock::time_point retire_at =
+        std::chrono::steady_clock::time_point::max();
 };
 
 // Plan §6: pure, driver-free predicate. Two different local source addresses
@@ -231,6 +249,31 @@ inline bool NatEntryClashes(const NatEntry& e, uint32_t app_ip_net,
 inline bool IsQuicPort(uint16_t port_host) { return port_host == 443; }
 
 // -------------------------------------------------------------- TCP session
+// Termination reason codes for one pump direction. The field log's
+// "↑300B ↓26B 5s [应用侧先关闭]" did not say WHY the app closed, so we
+// could not tell a local relay failure from a remote server verdict.
+enum CloseReason : int {
+    kCloseNone = 0,
+    kCloseEof = 1,          // recv()==0, clean FIN
+    kCloseReset = 2,        // WSAECONNRESET 10054
+    kCloseSockErr = 3,      // other recv() SOCKET_ERROR
+    kCloseSendFail = 4,     // send() failed on the other leg
+};
+
+const wchar_t* CloseReasonName(int r) {
+    switch (r) {
+        case kCloseEof: return L"recv EOF（对端 FIN）";
+        case kCloseReset: return L"recv WSAECONNRESET 10054（连接被重置）";
+        case kCloseSendFail: return L"send 失败（中继写入异常）";
+        case kCloseSockErr: return L"recv SOCKET_ERROR（其它错误码）";
+        default: return L"未正常结束";
+    }
+}
+
+// Defined with the socket helpers below; declared here so CloseOnce() can
+// emit an RST on a failed proxy handshake (ProxyBridge pb_relay.c:686).
+void ResetClose(SOCKET& s);
+
 struct TcpSession {
     // Handles are atomics: Stop() and the owning worker may both decide to
     // close, and exactly one of them must win (see CloseOnce).
@@ -241,13 +284,23 @@ struct TcpSession {
     std::atomic<uint64_t> up{0};     // app -> phone bytes
     std::atomic<uint64_t> down{0};   // phone -> app bytes
     // Which side closed first. -1 = still open, 0 = app, 1 = phone.
-    // The field log has many "↑0B ↓0B 0s" sessions; without this the reason
-    // for an immediate close is invisible.
     std::atomic<int> first_eof{-1};
     void NoteEof(int who) {
         int expected = -1;
         first_eof.compare_exchange_strong(expected, who);
     }
+
+    // Per-direction close evidence (index 0 = APP->PHONE, 1 = PHONE->APP).
+    std::atomic<int> close_reason[2]{{kCloseNone}, {kCloseNone}};
+    std::atomic<int> close_err[2]{{0}, {0}};
+    std::atomic<uint64_t> close_ms[2]{{0}, {0}};
+    // Written once before the pumps start, read only after both join.
+    std::chrono::steady_clock::time_point start;
+
+    // ProxyBridge pb_relay.c:686 — when the proxy handshake fails, an
+    // immediate RST tells the app to retry instead of idling for its own
+    // timeout. Only the app-facing leg is reset; the phone leg closes normally.
+    std::atomic<bool> want_reset{false};
 
     // Single owner of the close. beta0.1.3's CONNECT-failure branch closed
     // the accepted socket and returned WITHOUT deregistering, so the session
@@ -258,8 +311,8 @@ struct TcpSession {
     void CloseOnce() {
         SOCKET c = client.exchange(INVALID_SOCKET);
         if (c != INVALID_SOCKET) {
-            shutdown(c, SD_BOTH);
-            closesocket(c);
+            if (want_reset.exchange(false)) ResetClose(c);
+            else { shutdown(c, SD_BOTH); closesocket(c); }
         }
         SOCKET r = remote.exchange(INVALID_SOCKET);
         if (r != INVALID_SOCKET) {
@@ -273,6 +326,11 @@ struct TcpSession {
 // (shutdown SD_SEND on the other side) instead of killing both directions —
 // a server that closes its upload side while still downloading must keep
 // flowing (plan §07: 半关闭不得被误当作立即清理).
+//
+// NOTE: no SO_RCVTIMEO override here. beta0.1.6 set 1000ms on the src socket,
+// which silently re-applied a timeout that ConfigureRelaySocket() had just
+// cleared for the data phase (ProxyBridge pb_relay.c:704-709). Blocking recv
+// is correct: Stop() closes both sockets, which unblocks it.
 void Pump(TcpSession* s, int from) {
     SOCKET a = s->client.load();
     SOCKET b = s->remote.load();
@@ -281,9 +339,8 @@ void Pump(TcpSession* s, int from) {
     if (src == INVALID_SOCKET || dst == INVALID_SOCKET) return;
     auto* counter = from == 0 ? &s->up : &s->down;
     char buf[16384];
-    DWORD tmo = 1000;
-    setsockopt(src, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    int reason = kCloseNone;
+    int wsaerr = 0;
     for (;;) {
         // Termination relies purely on socket closure (Stop closes both
         // ends) — detached pumps never touch Impl members, so they cannot
@@ -295,12 +352,13 @@ void Pump(TcpSession* s, int from) {
             bool broken = false;
             while (sent < n) {
                 int r = send(dst, buf + sent, n - sent, 0);
-                if (r <= 0) { broken = true; break; }
+                if (r <= 0) { broken = true; wsaerr = WSAGetLastError(); break; }
                 sent += r;
             }
             if (broken) {
                 // hard failure in this direction: tear down BOTH ends so
                 // the sibling pump unblocks immediately
+                reason = kCloseSendFail;
                 s->CloseOnce();
                 break;
             }
@@ -309,10 +367,23 @@ void Pump(TcpSession* s, int from) {
             if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) continue;
             // from==0 reads the app socket, from==1 reads the phone socket
             s->NoteEof(from == 0 ? 0 : 1);
-            if (n == 0) shutdown(dst, SD_SEND);  // clean EOF: half-close only
+            wsaerr = e;
+            if (n == 0) {
+                reason = kCloseEof;
+                shutdown(dst, SD_SEND);  // clean EOF: half-close only
+            } else if (e == WSAECONNRESET) {
+                reason = kCloseReset;
+            } else {
+                reason = kCloseSockErr;
+            }
             break;
         }
     }
+    s->close_reason[from].store(reason);
+    s->close_err[from].store(wsaerr);
+    s->close_ms[from].store(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - s->start).count()));
 }
 
 struct TcpRegistry {
@@ -320,32 +391,47 @@ struct TcpRegistry {
     std::vector<std::shared_ptr<TcpSession>> live;
 };
 
-// F04: a REAL concurrency gate. beta0.1.3 spun 300×20ms and then dialled the
-// phone ANYWAY without holding a slot, so under load the phone still got 30+
-// simultaneous CONNECTs (REP=0x05, 3-5s stalls) while the reflected handshake
-// had already told the app "connected" — the app then saw a dead socket after
-// ~5s, i.e. "接通立马就结束". Now: no slot, no CONNECT. The wait is
-// interruptible so Stop() never hangs behind queued handshakes.
+// Concurrency control, beta0.1.7.
+//
+// Reference: ProxyBridge Windows/src/pb_relay.c:1030 (relay_pool_start, a
+// fixed pool of IOCP workers — one task per connection, NO queuing of
+// handshakes) and TqkLibrary TcpRelayServer.cs:112 (`Task.Run` per accepted
+// connection). Neither mature redirector serialises proxy handshakes.
+//
+// Why the old gate was wrong: beta0.1.6 set cap=3 with a 30s queue, and
+// TcpWorker took its start timestamp BEFORE Acquire(). The 0.1.6 field log
+// therefore reported "手机已接通 12716ms / 6351ms / 6346ms" while other
+// connections in the same burst took 45-99ms — those numbers were QUEUE
+// WAIT, not phone latency. A game opening 10+ sockets at once waited 6-12s
+// for its TLS bytes and failed with code=-306. That is the "很卡" symptom.
+//
+// Now: cap starts at 8 and adapts (AIMD). A transient failure or a slow
+// handshake halves it (floor 2); 16 consecutive fast successes raise it by
+// one (ceiling 12). Waiting is bounded at 8s; a timed-out flow is cancelled
+// and its app-side socket is RST so the app retries immediately. Queue wait
+// is measured separately and NEVER reported as CONNECT latency.
 struct ConnectGate {
     std::mutex m;
     std::condition_variable cv;
     int cur = 0;
-    // beta0.1.6 field log: even 8 concurrent handshakes saturated the
-    // phone's Kotlin ProxyServer — three "CONNECT reply missing" and
-    // individual CONNECTs of 3094ms / 10250ms, while the reflected
-    // handshake had ALREADY told the app "connected". The app then timed
-    // out waiting for TLS data and reset the flow ("通了又关"/"很卡").
-    // At low concurrency the same phone answers in 40-90ms, so serialising
-    // to 3 is FASTER end-to-end than letting it thrash. Everything else
-    // QUEUES (30s), never cancels — slow beats a dead socket.
-    int cap = 3;
+    int cap = 8;
+    int min_cap = 2;
+    int max_cap = 12;
+    bool adaptive = true;
+    int success_streak = 0;
 
-    bool Acquire(std::atomic<bool>* stop, int timeout_ms) {
+    bool Acquire(std::atomic<bool>* stop, int timeout_ms,
+                 int* waited_ms = nullptr) {
+        auto t0 = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lk(m);
         bool signalled = cv.wait_for(
             lk, std::chrono::milliseconds(timeout_ms), [&] {
                 return cur < cap || (stop && !stop->load());
             });
+        if (waited_ms)
+            *waited_ms = static_cast<int>(std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
         if (!signalled) return false;               // timed out: no slot
         if (stop && !stop->load()) return false;    // engine stopping
         if (cur >= cap) return false;
@@ -356,6 +442,31 @@ struct ConnectGate {
         std::lock_guard<std::mutex> lk(m);
         if (cur > 0) --cur;
         cv.notify_one();
+    }
+    // Called once per completed dial attempt (success or transient failure).
+    void ReportOutcome(bool transient_failure, int connect_ms) {
+        std::lock_guard<std::mutex> lk(m);
+        if (!adaptive) return;
+        if (transient_failure || connect_ms > 2500) {
+            cap = std::max(min_cap, cap / 2);
+            success_streak = 0;
+        } else if (++success_streak >= 16) {
+            cap = std::min(max_cap, cap + 1);
+            success_streak = 0;
+        }
+        cv.notify_all();  // a raised cap must wake queued flows
+    }
+    int Cap() {
+        std::lock_guard<std::mutex> lk(m);
+        return cap;
+    }
+    void Configure(int fixed_cap) {
+        std::lock_guard<std::mutex> lk(m);
+        if (fixed_cap > 0) {
+            adaptive = false;
+            cap = std::min(max_cap, std::max(min_cap, fixed_cap));
+        }
+        cv.notify_all();
     }
     void WakeAll() {
         std::lock_guard<std::mutex> lk(m);
@@ -429,6 +540,29 @@ struct EngineStats {
     // offered to UDP ASSOCIATE like any other datagram. Count what happens
     // so a game's QUIC traffic is observable instead of vanishing silently.
     std::atomic<uint64_t> udp443_seen{0};
+
+    // ---- beta0.1.7 (reference-driven) ---------------------------------
+    // Queue wait is measured SEPARATELY from CONNECT latency. The 0.1.6 log
+    // mixed them and made a 45ms phone look like a 12-second phone.
+    std::mutex gate_wait_mtx;
+    std::vector<int> gate_wait_ms;
+    // ProxyBridge conntrack: stale per-port state must die on a fresh SYN,
+    // and FIN/RST must retire a mapping immediately. Retransmitted SYNs are
+    // dropped instead of reflected twice (Tqk HoldSynForReconcile).
+    std::atomic<uint64_t> syn_dup_drop{0};
+    std::atomic<uint64_t> nat_syn_reset{0};
+    std::atomic<uint64_t> nat_fin_retire{0};
+    // ProxyBridge is_proxy_server_endpoint / is_proxy_udp_endpoint: the
+    // relay's OWN traffic must never re-enter the redirector.
+    std::atomic<uint64_t> endpoint_bypass{0};
+    // UDP reply injection is the half of the loop the field log never
+    // proved. Split it out of the global inject counters.
+    std::atomic<uint64_t> udp_inject_ok{0};
+    std::atomic<uint64_t> udp_inject_fail{0};
+    // Close-reason census: which side actually terminated the flow.
+    std::atomic<uint64_t> close_rst_app{0};
+    std::atomic<uint64_t> close_rst_remote{0};
+    std::atomic<uint64_t> close_send_fail{0};
 };
 
 std::wstring HUMAN_BYTES(uint64_t b) {
@@ -440,6 +574,124 @@ std::wstring HUMAN_BYTES(uint64_t b) {
     else
         swprintf(buf, 32, L"%lluB", (unsigned long long)b);
     return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Reference: InterceptSuite/ProxyBridge Windows/src/pb_util.c:88-92
+// (configure_tcp_socket) and pb_relay.c:640-649, 704-718; TqkLibrary
+// TcpRelayServer.cs:105 `client.NoDelay = true` and
+// RedirectedTcpConnection.cs:75 `new TcpClient { NoDelay = true }`.
+//
+// Both mature redirectors disable Nagle on BOTH legs of the relay. Without it
+// a game's small writes sit behind a delayed-ACK for up to hundreds of ms;
+// with the phone's cellular RTT that becomes multi-second stalls. ProxyBridge
+// also clears the handshake timeouts before the data phase — our SOCKS5
+// socket kept SO_SNDTIMEO=6s forever, so a slow send() tore the whole
+// session down via CloseOnce (the "↑300B ↓26B 5s" rows in the field log).
+void ConfigureRelaySocket(SOCKET s, bool data_phase) {
+    if (s == INVALID_SOCKET) return;
+    int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+    // 1 MB per direction (ProxyBridge uses 4 MB; we keep it lower because a
+    // phone uplink cannot sustain a larger in-flight window anyway).
+    int bufsz = 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+    if (data_phase) {
+        // ProxyBridge pb_relay.c:704-709 — the stream phase must NOT inherit
+        // the control-plane timeouts; recv()/send() must block indefinitely.
+        DWORD zero = 0;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&zero), sizeof(zero));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&zero), sizeof(zero));
+        setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
+                   reinterpret_cast<const char*>(&one), sizeof(one));
+        TcpKeepaliveVals ka{1, 300000, 1000};  // 5 min idle, 1 s probes
+        DWORD back = 0;
+        WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0,
+                 &back, nullptr, nullptr);
+    }
+}
+
+// Reference: ProxyBridge Windows/src/pb_relay.c:575-583 (`reset_close`) used
+// at :686/:698 when the proxy handshake fails. SO_LINGER{1,0} emits an RST so
+// the application learns IMMEDIATELY that this connection cannot be served —
+// a plain FIN leaves it waiting for its own 5 s timeout ("通了又关").
+void ResetClose(SOCKET& s) {
+    if (s == INVALID_SOCKET) return;
+    linger lg{};
+    lg.l_onoff = 1;
+    lg.l_linger = 0;
+    setsockopt(s, SOL_SOCKET, SO_LINGER,
+               reinterpret_cast<const char*>(&lg), sizeof(lg));
+    // NO shutdown() here: SD_SEND would emit a FIN first, and the app would
+    // see a clean EOF instead of the reset it needs in order to retry NOW.
+    // ProxyBridge's reset_close closes directly on a linger{1,0} socket.
+    closesocket(s);
+    s = INVALID_SOCKET;
+}
+
+// ---------------------------------------------------------------------------
+// Optional, file-based policy switches. Defaults reproduce beta0.1.6 exactly,
+// so adding the file can only CHANGE behaviour the tester explicitly asks for.
+// Reference: the architecture review's "每项保留可回退的开关" requirement.
+struct ExpPolicy {
+    bool udp443_drop = false;       // false = offer UDP/443 to ASSOCIATE
+    bool ipv6_allow = false;        // false = block global IPv6 egress
+    bool aaaa_suppress = true;      // true  = NOERROR/empty for AAAA
+    bool firewall_allow = false;    // true  = install inbound allow rule
+    int  concurrency = 0;           // 0 = adaptive (ProxyBridge/Tqk style)
+};
+
+// Win32 profile API: wide paths, no exceptions (build uses -fno-exceptions),
+// no std::filesystem / ifstream(wstring) portability traps. The file lives
+// next to the exe; absent file == all defaults (beta0.1.6 behaviour).
+ExpPolicy LoadPolicy() {
+    ExpPolicy p;
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring dir(self);
+    size_t sl = dir.rfind(L'\\');
+    if (sl != std::wstring::npos) dir = dir.substr(0, sl);
+    std::wstring path = dir + L"\\exp_policy.ini";
+    const wchar_t* sec = L"LinkHelm-exp";
+    wchar_t buf[64]{};
+    auto read = [&](const wchar_t* key, const wchar_t* def) {
+        buf[0] = 0;
+        GetPrivateProfileStringW(sec, key, def, buf, 64, path.c_str());
+    };
+    read(L"Udp443", L"proxy");
+    p.udp443_drop = (_wcsicmp(buf, L"drop") == 0);
+    read(L"IPv6", L"block");
+    p.ipv6_allow = (_wcsicmp(buf, L"allow") == 0);
+    read(L"Aaaa", L"suppress");
+    p.aaaa_suppress = (_wcsicmp(buf, L"allow") != 0);
+    read(L"FirewallInboundAllow", L"0");
+    p.firewall_allow = (_wcsicmp(buf, L"1") == 0);
+    int c = GetPrivateProfileIntW(sec, L"ConnectConcurrency", 0,
+                                  path.c_str());
+    if (c >= 1 && c <= 64) p.concurrency = c;
+    return p;
+}
+
+// Single source of truth for the capture filter. Both ExpEngine::Start and
+// the self-test use this function, so a filter change can never be "tested"
+// against a stale hand-copied string again.
+//   * outbound public IPv4 + IPv6, excluding loopback and impostor packets
+//     (packets WE injected must never re-enter the engine)
+//   * all directions on the listener's source port (loopback return path)
+std::string BuildCaptureFilter(const std::string& phone8, uint16_t local_port) {
+    std::string f =
+        "(outbound and !loopback and !impostor and ip.DstAddr != " +
+        phone8 + " and (tcp or udp))";
+    f += " or (outbound and !loopback and !impostor and ipv6)";
+    f += " or (tcp.SrcPort == " + std::to_string(local_port) +
+         " and !impostor)";
+    return f;
 }
 
 // F02: every WinDivertSend is verified. beta0.1.3 discarded the BOOL result
@@ -513,6 +765,8 @@ struct DnsProxy {
     size_t pool_cap = 8;
     std::string upstream = "223.5.5.5";
     std::string fallback = "8.8.8.8";
+    // exp_policy.ini Aaaa=allow disables suppression for compatibility tests.
+    std::atomic<bool> aaaa_suppress{true};
 };
 
 void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
@@ -622,7 +876,8 @@ void DnsProxyLoop(DnsProxy* p, const std::string& phone8, uint16_t phone_port,
         // AAAA suppression BEFORE any SOCKS5 work: with no IPv6-capable
         // upstream, a NOERROR/empty answer stops the OS from opening IPv6
         // sockets that would otherwise be dropped or leak out natively.
-        if (n >= 12 && IsAaaaOnlyQuery(buf, (size_t)n)) {
+        if (p->aaaa_suppress.load() && n >= 12 &&
+            IsAaaaOnlyQuery(buf, (size_t)n)) {
             std::vector<uint8_t> r = MakeEmptyDnsReply(buf, (size_t)n);
             sendto(p->sock, reinterpret_cast<const char*>(r.data()),
                    (int)r.size(), 0,
@@ -776,33 +1031,41 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
                TcpRegistry* reg, std::shared_ptr<EngineStats> stats,
                ConnectGate* gate, std::atomic<bool>* stop,
                std::atomic<int>* budget) {
-    auto t0 = std::chrono::steady_clock::now();
     std::wstring dstw = IpW(htonl(entry.orig_dst_ip)) + L":" +
                         std::to_wstring(entry.orig_dst_port);
-    // F04: a slot must be HELD before dialling the phone. When the gate is
-    // saturated we cancel instead of adding a 25th handshake to a phone that
-    // is already answering REP=0x05 / 3-5s. The wait is cancellable, so
-    // Stop()/FAULTED never hangs behind a queued handshake.
-    if (!gate->Acquire(stop, 30000)) {
+    // beta0.1.7: queue wait is measured separately and MUST NOT be reported
+    // as CONNECT latency (see ConnectGate comment). Reference implementations
+    // do not queue handshakes at all, so the timeout is short and adaptive.
+    int waited_ms = 0;
+    if (!gate->Acquire(stop, 8000, &waited_ms)) {
         stats->gate_timeout.fetch_add(1);
         log(L"[exp] #" + std::to_wstring(flow_id) +
             L" 并发闸门超时或引擎停止 → 取消（未向手机发起 CONNECT）→ " +
-            dstw);
+            dstw + L"（排队 " + std::to_wstring(waited_ms) + L"ms）");
+        // ProxyBridge pb_relay.c:686 — RST instead of a lingering FIN.
+        s->want_reset.store(true);
         SessionFinalize(s, reg, stats, budget);
         return;
     }
-    // beta0.1.5: one retry for TRANSIENT handshake failures only. A phone
-    // under load sometimes accepts the TCP connection, then drops it before
-    // answering CONNECT; an immediate second dial succeeds. An explicit
-    // REP != 0x00 (refused/unreachable) is NOT retried — that is a real
-    // server-side verdict, not a transient loss.
+    {
+        std::lock_guard<std::mutex> lk(stats->gate_wait_mtx);
+        if (stats->gate_wait_ms.size() < 512)
+            stats->gate_wait_ms.push_back(waited_ms);
+    }
+    // t0 starts HERE: only the real SOCKS5 dial is measured now.
+    auto t0 = std::chrono::steady_clock::now();
+
+    // beta0.1.5: retry TRANSIENT handshake failures only. A phone under load
+    // sometimes accepts TCP then drops it before answering CONNECT; an
+    // immediate second dial succeeds. An explicit REP != 0x00 is a verdict,
+    // not a transient loss, and is not retried.
     std::string err;
     SOCKET r = INVALID_SOCKET;
+    bool had_transient = false;
     constexpr int kMaxConnectAttempts = 3;
     for (int attempt = 0; attempt < kMaxConnectAttempts; ++attempt) {
         // NOTE: this pointer is &Impl::running (true == engine RUNNING),
-        // despite the historical parameter name "stop". A stopped engine
-        // must NOT start another handshake.
+        // despite the historical parameter name "stop".
         if (!stop->load()) break;
         err.clear();
         r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
@@ -813,44 +1076,62 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
             break;
         }
         if (attempt == 0) stats->connect_retry.fetch_add(1);
-        bool transient =
+        had_transient =
             err.find("reply missing") != std::string::npos ||
             err.find("timeout") != std::string::npos ||
             err.find("timed out") != std::string::npos ||
             err.find("unreachable") != std::string::npos ||
             err.find("send failed") != std::string::npos;
-        if (!transient || attempt + 1 >= kMaxConnectAttempts) break;
+        if (!had_transient || attempt + 1 >= kMaxConnectAttempts) break;
         Sleep(250);
     }
+    int dial_ms = static_cast<int>(std::chrono::duration_cast<
+        std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+        .count());
     gate->Release();
+    gate->ReportOutcome(r == INVALID_SOCKET || had_transient, dial_ms);
+
     if (r == INVALID_SOCKET) {
-        // Surface the failure to the app as an immediate disconnect (never
-        // fake "connected"): the plan document's observable-failure rule.
         stats->socks_fail.fetch_add(1);
         log(L"[exp] #" + std::to_wstring(flow_id) + L" SOCKS5 CONNECT 失败 (" +
-            FromUtf8(err) + L") → " + dstw);
+            FromUtf8(err) + L", " + std::to_wstring(dial_ms) + L"ms) → " +
+            dstw + L" → 向应用发送 RST");
+        // ProxyBridge reset_close: fail FAST so the app reconnects instead of
+        // waiting out its own 5 s timeout.
+        s->want_reset.store(true);
         SessionFinalize(s, reg, stats, budget);
         return;
     }
     s->remote.store(r);
     stats->socks_ok.fetch_add(1);
-    int ms = static_cast<int>(std::chrono::duration_cast<
-        std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
-        .count());
     {
         std::lock_guard<std::mutex> lk(stats->connect_ms_mtx);
-        if (stats->connect_ms.size() < 512) stats->connect_ms.push_back(ms);
+        if (stats->connect_ms.size() < 512)
+            stats->connect_ms.push_back(dial_ms);
     }
+    // ProxyBridge pb_relay.c:640-649, 704-718 / Tqk NoDelay: disable Nagle,
+    // enlarge buffers, CLEAR the control-plane timeouts, enable keep-alive.
+    ConfigureRelaySocket(s->client.load(), true);
+    ConfigureRelaySocket(r, true);
+    s->start = t0;
     log(L"[exp] #" + std::to_wstring(flow_id) + L" 手机已接通 → " + dstw +
-        L" (" + std::to_wstring(ms) + L"ms)");
+        L" (CONNECT " + std::to_wstring(dial_ms) + L"ms, 排队 " +
+        std::to_wstring(waited_ms) + L"ms)");
     std::thread t1(Pump, s.get(), 0);
     std::thread t2(Pump, s.get(), 1);
     t1.join();
     t2.join();
-    auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - t0).count();
+    uint64_t total_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
     uint64_t up = s->up.load(), down = s->down.load();
     int eof = s->first_eof.load();
+    int r0 = s->close_reason[0].load(), r1 = s->close_reason[1].load();
+    int e0 = s->close_err[0].load(), e1 = s->close_err[1].load();
+    if (r0 == kCloseReset) stats->close_rst_app.fetch_add(1);
+    if (r1 == kCloseReset) stats->close_rst_remote.fetch_add(1);
+    if (r0 == kCloseSendFail || r1 == kCloseSendFail)
+        stats->close_send_fail.fetch_add(1);
     std::wstring why;
     if (up == 0 && down == 0) {
         stats->tcp_zero_close.fetch_add(1);
@@ -864,9 +1145,19 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     } else {
         why = L"双向硬关闭";
     }
-    log(L"[exp] #" + std::to_wstring(flow_id) + L" 结束 " + dstw +
-        L" ↑" + HUMAN_BYTES(up) + L" ↓" + HUMAN_BYTES(down) + L" " +
-        std::to_wstring(secs) + L"s [" + why + L"]");
+    // Structured close report requested by the architecture review: without
+    // the per-direction WSA error it is impossible to tell the phone, the
+    // remote server and the local reflection apart.
+    log(L"[exp] #" + std::to_wstring(flow_id) + L" TCP 结束 目标=" + dstw +
+        L" CONNECT=" + std::to_wstring(dial_ms) + L"ms 持续=" +
+        std::to_wstring(total_ms) + L"ms 上行=" + HUMAN_BYTES(up) +
+        L" 下行=" + HUMAN_BYTES(down));
+    log(L"[exp] #" + std::to_wstring(flow_id) + L"   APP→手机: " +
+        CloseReasonName(r0) + L" err=" + std::to_wstring(e0) + L" @" +
+        std::to_wstring(s->close_ms[0].load()) + L"ms | 手机→APP: " +
+        CloseReasonName(r1) + L" err=" + std::to_wstring(e1) + L" @" +
+        std::to_wstring(s->close_ms[1].load()) + L"ms");
+    log(L"[exp] #" + std::to_wstring(flow_id) + L"   结束原因: " + why);
     SessionFinalize(s, reg, stats, budget);
 }
 
@@ -985,9 +1276,17 @@ void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
         addr.Network.IfIdx = sess->if_idx;
         addr.Network.SubIfIdx = sess->sub_if_idx;
         wd.checksums(pkt.data(), (UINT)psz, &addr, 0);
+        // beta0.1.7: the review asked for proof of the UDP REPLY leg.
+        // `udp_reply` used to be incremented only on a successful global
+        // injection, mixed with TCP reflection/DNS replies; split it out so
+        // "发送 N / 回包 N" can be read as a real UDP round-trip census.
         if (WdInject(divert, wd, pkt.data(), (UINT)psz, &addr, L"UDP 回包", 0,
-                     stats, log))
+                     stats, log)) {
             stats->udp_reply.fetch_add(1);
+            stats->udp_inject_ok.fetch_add(1);
+        } else {
+            stats->udp_inject_fail.fetch_add(1);
+        }
     }
     // Hand the session back to MainLoop for a fresh ASSOCIATE. Only while
     // the engine is alive — during Stop() a rebuild would outlive the driver.
@@ -1131,6 +1430,55 @@ bool RunNetsh(const std::wstring& args) {
     return code == 0;
 }
 
+// Reference: ProxyBridge Windows/src/ProxyBridge.c:1153-1215 (fw_ensure_thread).
+// Redirected connections reach the local listener as INBOUND traffic on the
+// app's original interface. Windows only auto-prompts for the Private profile,
+// so on a Public-classified adapter (Wi-Fi Direct / VPN often are) the
+// firewall silently drops the redirected SYN — the capture log looks normal
+// but the app times out. Best effort, elevation required, opt-in via
+// exp_policy.ini FirewallInboundAllow=1; the rule is scoped to this exe only.
+bool EnsureFirewallInboundRule(std::wstring* detail) {
+    BOOL elevated = FALSE;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION te{};
+        DWORD n = 0;
+        if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &n))
+            elevated = te.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    if (!elevated) {
+        *detail = L"未提权 → 跳过（Public 配置文件的入站 SYN 可能被防火墙丢弃）";
+        return false;
+    }
+    wchar_t exe[MAX_PATH]{};
+    DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        *detail = L"取 exe 路径失败";
+        return false;
+    }
+    unsigned h = 2166136261u;
+    for (const wchar_t* p = exe; *p; ++p) {
+        wchar_t c = *p;
+        if (c >= L'A' && c <= L'Z') c += 32;
+        h = (h ^ static_cast<unsigned>(c)) * 16777619u;
+    }
+    wchar_t name[96];
+    swprintf(name, 96, L"LinkHelm-exp relay %08x", h);
+    std::wstring rname(name);
+    if (RunNetsh(L"advfirewall firewall show rule name=\"" + rname + L"\"")) {
+        *detail = L"规则已存在";
+        return true;
+    }
+    bool ok = RunNetsh(
+        L"advfirewall firewall add rule name=\"" + rname +
+        L"\" dir=in action=allow program=\"" + std::wstring(exe) +
+        L"\" enable=yes profile=any description=\"LinkHelm-exp local relay "
+        L"inbound allow (all profiles)\"");
+    *detail = ok ? L"已添加全配置文件入站放行规则" : L"添加失败（检查权限/防火墙服务）";
+    return ok;
+}
+
 // Find the adapter whose DEFAULT GATEWAY is the phone (Wi-Fi Direct GO) and
 // back up its DNS list. The PC's own address on that adapter is 192.168.49.x,
 // NOT the phone's 192.168.49.1 — matching by unicast IP never fired before,
@@ -1243,9 +1591,12 @@ struct ExpEngine::Impl {
     bool phone_only_uplink = true;
     DWORD uplink_if = 0;
 
-    // Bounds concurrent SOCKS5 CONNECT handshakes (F04: a real gate — no
-    // slot means no CONNECT at all, and the wait is cancellable).
+    // beta0.1.7: adaptive concurrency, short bounded queue, AIMD on phone
+    // saturation. See ConnectGate for the ProxyBridge/Tqk provenance.
     ConnectGate connect_gate;
+
+    // exp_policy.ini switches; defaults reproduce beta0.1.6 behaviour.
+    ExpPolicy policy;
 
     // F05: STARTING → RUNNING → FAULTED / STOPPED. "UI says 已连接" must never
     // outlive the capture thread: a dead WinDivertRecv used to break out of
@@ -1410,9 +1761,18 @@ void ExpEngine::Impl::ExpireLoop() {
         {
             std::lock_guard<std::mutex> lk(nat_mtx);
             for (auto it = nat.begin(); it != nat.end();) {
+                // ProxyBridge cleanup_worker: a mapping whose flow is gone
+                // must not survive until the ephemeral port is recycled.
+                // `last` is refreshed by EVERY packet of a live flow, so 30s
+                // of silence is safe even for idle HTTPS keep-alives (which
+                // send keep-alive probes / ACKs). FIN-marked entries retire
+                // after 5s (ProxyBridge connection_fin).
                 auto age = std::chrono::duration_cast<std::chrono::seconds>(
                     now - it->second.last).count();
-                if (age > 300) it = nat.erase(it);
+                bool retired = it->second.retire_at !=
+                    std::chrono::steady_clock::time_point::max() &&
+                    now >= it->second.retire_at;
+                if (age > 30 || retired) it = nat.erase(it);
                 else ++it;
             }
         }
@@ -1438,7 +1798,7 @@ void ExpEngine::Impl::ExpireLoop() {
             const wchar_t* st = StateName(state.load());
             // Handshake latency distribution: if p95 is in seconds the
             // bottleneck is the phone SOCKS5 server, not the local relay.
-            int p50 = 0, p95 = 0, cmax = 0;
+            int p50 = 0, p95 = 0, cmax = 0, q95 = 0;
             {
                 std::lock_guard<std::mutex> lk(stats->connect_ms_mtx);
                 std::vector<int> v(stats->connect_ms);
@@ -1447,6 +1807,14 @@ void ExpEngine::Impl::ExpireLoop() {
                     p50 = v[v.size() / 2];
                     p95 = v[(v.size() * 95) / 100];
                     cmax = v.back();
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(stats->gate_wait_mtx);
+                std::vector<int> v(stats->gate_wait_ms);
+                if (!v.empty()) {
+                    std::sort(v.begin(), v.end());
+                    q95 = v[(v.size() * 95) / 100];
                 }
             }
             log(L"[exp] 统计[" + std::wstring(st) + L"]: TCP 活动 " +
@@ -1480,12 +1848,22 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" 代理 " + std::to_wstring(stats->udp_proxy.load()) +
                 L" | 闸门重试 " + std::to_wstring(stats->connect_retry.load()) +
                 L" 成功 " + std::to_wstring(stats->connect_retry_ok.load()) +
+                L" | 并发上限 " + std::to_wstring(connect_gate.Cap()) +
                 L" | CONNECT p50 " + std::to_wstring(p50) +
                 L" p95 " + std::to_wstring(p95) +
                 L" 最大 " + std::to_wstring(cmax) + L"ms" +
+                L" | 排队 p95 " + std::to_wstring(q95) + L"ms（应与 CONNECT 分离）" +
                 L" | 零字节关闭 " + std::to_wstring(stats->tcp_zero_close.load()) +
                 L" 手机先关 " + std::to_wstring(stats->tcp_eof_remote.load()) +
                 L" 应用先关 " + std::to_wstring(stats->tcp_eof_app.load()) +
+                L" RST(应用/手机) " + std::to_wstring(stats->close_rst_app.load()) +
+                L"/" + std::to_wstring(stats->close_rst_remote.load()) +
+                L" 写失败 " + std::to_wstring(stats->close_send_fail.load()) +
+                L" | UDP 回注 " + std::to_wstring(stats->udp_inject_ok.load()) +
+                L"/失败 " + std::to_wstring(stats->udp_inject_fail.load()) +
+                L" | SYN 重置 " + std::to_wstring(stats->nat_syn_reset.load()) +
+                L" FIN/RST 退休 " + std::to_wstring(stats->nat_fin_retire.load()) +
+                L" 代理端点放行 " + std::to_wstring(stats->endpoint_bypass.load()) +
                 L" | 阻断 " + std::to_wstring(stats->blocked.load()) +
                 L" | 未代理泄漏 " + std::to_wstring(stats->leak.load()) +
                 L"（应为 0） | 接管审计 经引擎 " +
@@ -1555,6 +1933,14 @@ void ExpEngine::Impl::MainLoop() {
                          stats, log);
                 continue;
             }
+            if (policy.ipv6_allow) {
+                // Explicit opt-in compatibility test ONLY. The phone's SOCKS5
+                // speaks ATYP=IPv4, so this is a DIRECT pass-through and will
+                // show up as an unproxied egress — that is the experiment.
+                WdInject(divert, wd, pkt.data(), len, &addr,
+                         L"IPv6 策略放行(测试)", 0, stats, log);
+                continue;
+            }
             stats->ipv6_drop.fetch_add(1);
             continue;  // fail-closed: never leak
         }
@@ -1562,6 +1948,21 @@ void ExpEngine::Impl::MainLoop() {
         uint16_t sport = tcph ? tcph->SrcPort : (udph ? udph->SrcPort : 0);
         uint16_t dport = tcph ? tcph->DstPort : (udph ? udph->DstPort : 0);
         if (udph) stats->udp_capture.fetch_add(1);
+
+        // ---- ProxyBridge is_proxy_server_endpoint / is_proxy_udp_endpoint
+        // (Windows/src/ProxyBridge.c:89-125). The relay's OWN upstream
+        // sockets draw local ports from the same ephemeral pool as the apps;
+        // if one of their packets re-enters the redirector, the relay proxies
+        // itself and "proxied apps then hang while the log still looks
+        // normal". Exclude the phone SOCKS5 endpoint in BOTH directions and
+        // for both protocols before any per-port state is consulted.
+        if (dst_ip == phone_net || iph->SrcAddr == phone_net ||
+            ntohs(dport) == cfg.phone_port || ntohs(sport) == cfg.phone_port) {
+            stats->endpoint_bypass.fetch_add(1);
+            WdInject(divert, wd, pkt.data(), len, &addr, L"代理端点放行", 0,
+                     stats, log);
+            continue;
+        }
 
         // ---- listener return path (loopback, SrcPort == local_port) ----
         if (tcph && ntohs(sport) == local_port) {
@@ -1643,63 +2044,82 @@ void ExpEngine::Impl::MainLoop() {
         if (tcph) {
             NatKey key{ntohl(dst_ip), ntohs(sport)};
             bool have = false;
+            bool collision = false;
             NatEntry entry;
+            bool syn = tcph->Syn && !tcph->Ack;
+            bool fin_or_rst = tcph->Fin || tcph->Rst;
             auto nat_now = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> lk(nat_mtx);
                 auto it = nat.find(key);
+                if (syn && it != nat.end()) {
+                    // ProxyBridge Windows/src/ProxyBridge.c:81-88 and
+                    // :805-814 (`reset_stale_tcp_state` on every fresh SYN):
+                    // an ephemeral port may have been recycled by a NEW
+                    // connection after the old one died without FIN/RST.
+                    // Keeping the old mapping splices the new flow into the
+                    // previous destination. A retransmitted SYN simply gets
+                    // re-tracked with the same answer (ProxyBridge wording),
+                    // so this is safe for retransmissions too.
+                    nat.erase(it);
+                    stats->nat_syn_reset.fetch_add(1);
+                    it = nat.end();
+                }
                 if (it != nat.end()) {
-                    // Plan §6: a stale mapping from a dead flow may be
-                    // reclaimed; a LIVE mapping owned by another local
-                    // address / destination port must NEVER be reused.
+                    // A non-SYN packet may only reuse a mapping that belongs
+                    // to the SAME flow (local address + destination port).
+                    // Otherwise two TCP flows would be spliced together.
                     bool clash = NatEntryClashes(it->second, iph->SrcAddr,
                                                  ntohs(dport));
-                    // A dead flow's mapping must not block a legitimate
-                    // source-port reuse for minutes. `last` is refreshed by
-                    // EVERY packet of a live flow, so 15s of silence means
-                    // the flow is gone, not idle-long-lived.
-                    bool stale = std::chrono::duration_cast<
-                        std::chrono::seconds>(nat_now - it->second.last)
-                        .count() > 15;
-                    if (clash && stale) {
-                        nat.erase(it);
-                    } else {
-                        it->second.last = nat_now;
-                        entry = it->second;
+                    it->second.last = nat_now;
+                    entry = it->second;
+                    if (!clash) {
                         have = true;
+                        if (fin_or_rst) {
+                            // ProxyBridge :856-871 remove_connection (RST)
+                            // / connection_fin (FIN). Copy the entry first:
+                            // THIS packet still has to be reflected.
+                            stats->nat_fin_retire.fetch_add(1);
+                            if (tcph->Rst) nat.erase(it);
+                            else it->second.retire_at = nat_now +
+                                 std::chrono::seconds(5);
+                        }
+                    } else {
+                        collision = true;
                     }
                 }
             }
-            if (have && NatEntryClashes(entry, iph->SrcAddr, ntohs(dport))) {
-                // Refusing is safe: TCP retransmits the SYN, usually with a
-                // different source port, so the next lookup gets a free key.
+            if (collision) {
                 uint64_t n = stats->nat_collision.fetch_add(1) + 1;
                 if (n <= 3)
-                    log(L"[exp] NAT 键碰撞: 拒绝复用 {目标 " + IpW(dst_ip) +
-                        L", 源端口 " + std::to_wstring(ntohs(sport)) +
-                        L"} 的既有映射（本机地址/目的端口不同），该 SYN 丢弃，" +
-                        L"应用将以新源端口重传");
+                    log(L"[exp] NAT 键碰撞: 拒绝复用 本机=" +
+                        IpW(iph->SrcAddr) + L":" +
+                        std::to_wstring(ntohs(sport)) + L" → 目标=" +
+                        IpW(dst_ip) + L":" +
+                        std::to_wstring(ntohs(dport)) +
+                        L"；既有映射 目标=" + IpW(htonl(entry.orig_dst_ip)) +
+                        L":" + std::to_wstring(entry.orig_dst_port) +
+                        L" 本机=" + IpW(entry.app_ip) +
+                        L"（完整五元组不一致），该包丢弃");
+                stats->blocked.fetch_add(1);
+                continue;
+            }
+            if (!have && !syn) {
+                // An already-established flow whose SYN we never saw CANNOT
+                // be taken over mid-stream (architecture doc §4). Passing it
+                // through would send it out unproxied — the egress-IP flap.
                 stats->blocked.fetch_add(1);
                 continue;
             }
             if (!have) {
-                bool syn = tcph->Syn && !tcph->Ack;
-                if (!syn) {
-                    // An already-established flow whose SYN we never saw
-                    // CANNOT be taken over mid-stream (architecture doc §4).
-                    // Passing it through would send it out unproxied — the
-                    // egress-IP flap. Drop it; TCP retransmits the SYN and
-                    // we then capture that connection cleanly.
-                    stats->blocked.fetch_add(1);
-                    continue;
-                }
                 entry.orig_dst_ip = ntohl(dst_ip);
                 entry.orig_dst_port = ntohs(dport);
                 entry.app_ip = iph->SrcAddr;
                 entry.if_idx = addr.Network.IfIdx;
                 entry.sub_if_idx = addr.Network.SubIfIdx;
                 entry.flow_id = next_flow.fetch_add(1);
-                entry.last = std::chrono::steady_clock::now();
+                entry.last = nat_now;
+                entry.retire_at = std::chrono::steady_clock::time_point::max();
                 uint64_t flow_id = entry.flow_id;
                 {
                     std::lock_guard<std::mutex> lk(nat_mtx);
@@ -1739,9 +2159,15 @@ void ExpEngine::Impl::MainLoop() {
             if (IsQuicPort(ntohs(dport))) {
                 uint64_t n = stats->udp443_seen.fetch_add(1) + 1;
                 if (n == 1)
-                    log(L"[exp] 策略: 检测到 UDP/443（QUIC 或游戏流量）— "
-                        L"不再无条件丢弃，交给 SOCKS5 UDP ASSOCIATE 转发；"
-                        L"若手机不支持则 fail-closed 丢弃并计入统计");
+                    log(L"[exp] 策略: 检测到 UDP/443（QUIC 或游戏流量）— " +
+                        std::wstring(policy.udp443_drop
+                            ? L"exp_policy.ini Udp443=drop → 显式丢弃"
+                            : L"交给 SOCKS5 UDP ASSOCIATE 转发；"
+                              L"若手机不支持则 fail-closed 丢弃并计入统计"));
+                if (policy.udp443_drop) {
+                    stats->udp_drop.fetch_add(1);
+                    continue;   // opt-in compatibility switch, never default
+                }
             }
             uint64_t key = (static_cast<uint64_t>(ntohl(iph->SrcAddr)) << 16) |
                            ntohs(sport);
@@ -1856,6 +2282,24 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     }
     I->cfg = cfg;
     I->state.store(Impl::kStarting);
+    I->policy = LoadPolicy();
+    I->dnsproxy.aaaa_suppress.store(I->policy.aaaa_suppress);
+    I->connect_gate.Configure(I->policy.concurrency);
+    I->log(L"[exp] 策略: UDP443=" +
+           std::wstring(I->policy.udp443_drop ? L"drop" : L"proxy") +
+           L" IPv6=" +
+           (I->policy.ipv6_allow ? L"allow(测试)" : L"block") +
+           L" AAAA=" +
+           (I->policy.aaaa_suppress ? L"suppress" : L"allow(测试)") +
+           L" 并发=" + std::to_wstring(I->connect_gate.Cap()) +
+           (I->policy.concurrency > 0 ? L"(固定)" : L"(自适应)") +
+           L" 防火墙入站=" +
+           (I->policy.firewall_allow ? L"允许添加" : L"仅检测"));
+    if (I->policy.firewall_allow) {
+        std::wstring fw;
+        EnsureFirewallInboundRule(&fw);
+        I->log(L"[exp] ENGINE_FIREWALL " + fw);
+    }
     I->phone8 = ToUtf8(cfg.phone_ip);
     I->auth.user = ToUtf8(cfg.socks_user);
     I->auth.pass = ToUtf8(cfg.socks_pass);
@@ -2034,12 +2478,7 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     //  * `outbound` on the IPv6 branch missed any inbound-classified egress.
     // Verified with WinDivertHelperCompileFilter: `impostor` is a legal
     // filter token on this WinDivert build.
-    std::string filter =
-        "(outbound and !loopback and !impostor and ip.DstAddr != " +
-        I->phone8 + " and (tcp or udp))";
-    filter += " or (outbound and !loopback and !impostor and ipv6)";
-    filter += " or (tcp.SrcPort == " + std::to_string(I->local_port) +
-              " and !impostor)";
+    std::string filter = BuildCaptureFilter(I->phone8, I->local_port);
 
     I->status(L"打开 WinDivert 捕获…");
     HANDLE h = I->wd.open(filter.c_str(), WINDIVERT_LAYER_NETWORK, 0, 0);

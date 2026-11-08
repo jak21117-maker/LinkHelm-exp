@@ -76,17 +76,22 @@ engine/linkhelm_ics.exe  ICS 共享模块（与主线同一构建）
 
 ## 实验边界（如实声明）
 
-- **驱动层未在本机实测**：`WinDivertOpen` 在开发机返回 `err=5`（无管理员权限），
-  所以 NETWORK 层真实捕获与回注注入只能由使用者在管理员权限下验证。自测覆盖
-  的是驱动上下游全部产品代码（用 WinDivert 自带无驱动 helper 校验过滤器语义）。
+- **驱动层未在本机实测**：`WinDivertOpen` 在开发机返回 `err=5`（无管理员权限）。
+  beta0.1.7 起随包提供 `tests/driver_probe.exe`：**以管理员运行即可一次性判定**
+  「真实出站包能否被捕获」与「注入的入站 UDP 包能否被普通 socket 收到」（后者
+  即 UDP 回包闭环）。无提权时它明确输出 `SKIP / NOT PROVEN`，不算通过。
+- `tests/exp_selftest.cpp` 只保留 10 条跨真实 socket 的端到端断言；纯函数/自证类
+  断言已按要求删除。**断言数量不代表可上网**，判定驱动层只认 `driver_probe.exe`。
 - IPv6 全局单播出站 **显式阻断并计数**（手机 SOCKS5 无 IPv6 能力）；本地
   link-local / multicast 放行。DNS 代理对 AAAA 返回 NOERROR 空答案。
-- UDP:443 自 beta0.1.4 起**不再无条件丢弃**，交给 UDP ASSOCIATE 转发；
-  手机不支持时由 fail-closed 路径丢弃并计数（游戏 QUIC 需求可观测）。
+- UDP:443 / IPv6 / AAAA 三项策略由可选的 `exp_policy.ini` 控制，**默认值与
+  beta0.1.6 完全一致**；模板见 `exp_policy.ini.example`。每次只改一项、保留日志。
 - NAT 键碰撞（不同本机地址/目的端口复用同一 `{dst_ip, src_port}`）**拒绝复用
-  并计数**，不再静默拼接两条流；陈旧映射（>60s）自动回收。
+  并计数**；FIN/RST 到达时立即退休映射（对齐 ProxyBridge conntrack），
+  15s 静默兜底回收。
 - IP 分片报文（非首片）无法匹配 NAT 表，按策略丢弃（LAN MTU 1500 下罕见）。
-- 每条 TCP 连接 2 个泵线程（wfp-divert 同款），并发闸门上限 24，IOCP 化留待后续。
+- 每条 TCP 连接 2 个泵线程；并发默认**自适应 AIMD**（初始 8，手机饱和时减半，
+  连续 16 次成功后 +1，范围 2–12），可用 `ConnectConcurrency` 固定做对照实验。
 - 多设备网关（FORWARD+NAT）按方案文档为独立专题，不在本仓库承诺。
 
 ## 目录
@@ -111,7 +116,45 @@ tests\socks5_probe.exe 192.168.49.1 8080 <账号> <密码>
 
 这段输出能一次性区分三类问题：手机根本没开 UDP relay（ASSOCIATE 失败或 4s 无回包）、手机回包端口与 `BND.PORT` 不一致（beta0.1.5 会因此永久杀死接收线程，beta0.1.6 已兼容）、或回包 ATYP/FRAG 非标准。这正是架构评审反复强调「必须用实测说话、不能假设手机 SOCKS5 完全标准」的未知项。
 
+## 真机验收第一步：`driver_probe.exe`（需管理员）
+
+```
+以管理员身份运行  tests\driver_probe.exe
+```
+
+它用 RFC 5737 文档地址 `203.0.113.7` 和一个极窄过滤器，只做两件事：
+**A** 验证真实出站 UDP 包能被 WinDivert 捕获；**B** 注入一个入站 UDP 包，
+验证普通 UDP socket 能收到。B 就是引擎 `UdpRecvThread` 赖以工作的
+「回包闭环」。不改路由 / DNS / 防火墙 / 注册表，退出码 `0=WORKING`、
+`1=BROKEN`、`2=无提权（未验证）`。**B2 失败即可定点**：`WinDivertSend`
+成功但 socket 收不到时，问题在 `IfIdx` / 防火墙 / 网络配置文件，
+继续改 SOCKS5 代码是无效的。
+
+另附 `tests/egress_compare.ps1`（只读，5 次对照显式 SOCKS5 出口与透明出口）
+用于区分「Windows 流量绕过」和「手机蜂窝 CGNAT 轮换」。
+
 ## Changelog
+
+### beta0.1.7 — 对照 ProxyBridge / TqkLibrary.WinDivert 的结构性修正 + 测试精简
+
+本轮不再靠推理打补丁，逐条对照两个成熟项目的真实源码。
+
+| 参考出处 | 差异 / 修复 |
+| --- | --- |
+| `ProxyBridge pb_relay.c:88-92, 640-649, 704-718`；`Tqk TcpRelayServer.cs:105` | 两侧 relay socket 全部 `TCP_NODELAY=1` + 1MB 收发缓冲；数据阶段**清除** `SO_RCVTIMEO/SO_SNDTIMEO`（6s 控制面超时会误杀慢速数据流，对应日志 `↑300B ↓26B 5s`）；`SO_KEEPALIVE` + `SIO_KEEPALIVE_VALS`。`Pump()` 不再重设 1s 超时覆盖上述设置 |
+| `ProxyBridge pb_relay.c:575-583, :686` | 代理握手失败时用 `SO_LINGER{1,0}` 发 **RST** 让应用立刻重连，不再等自己的 5s 超时；正常结束仍走 FIN |
+| `ProxyBridge relay_pool_start` / `Tqk AcceptLoop Task.Run` | 两者**都没有串行排队闸门**。移除把排队时间计入 CONNECT 耗时的 `t0` 位置错误（日志 `12716ms` 里绝大部分是排队，真实拨号仅 45–99ms）；并发改为自适应 AIMD（初始 8，饱和减半，16 连胜 +1，范围 2–12），等待上限 8s；`排队` 与 `CONNECT` 分别记录 |
+| `ProxyBridge ProxyBridge.c:856-871`；`Tqk HoldSynForReconcile` | 新 SYN 清理同端口旧状态；FIN/RST 立即退休 NAT 项；完整五元组碰撞日志；15s 兜底 |
+| `ProxyBridge ProxyBridge.c:89-125` | 双向排除手机 SOCKS5 端点（IP 与端口），防止 relay 自代理；filter 第三条改为**全方向**捕获 listener 回包 |
+| `ProxyBridge ProxyBridge.c:1153-1215` | 可选「全配置文件入站放行」规则（Public 配置文件会静默丢弃反射 SYN），需提权且默认关闭 |
+| 架构评审 §2/§3 | 每条会话输出双向 `EOF/RST/超时/send 失败 + WSA 错误码 + 毫秒时间戳`；UDP 回注成功/失败单独计数；UDP443 / IPv6 / AAAA 三项加可回退开关 |
+
+**测试按要求精简**：删除全部纯函数 / mock / 自证类断言（`exp_selftest.cpp`
+1309 行 → 约 420 行，97 项 → **10 项**），只保留跨真实 socket 的端到端断言；
+filter 断言改为直接调用产品 `BuildCaptureFilter()`，不再手抄字符串。
+全部改完后**编译一次、只跑一遍**：10/10 通过、EXIT=0。关键是新增
+`tests/driver_probe.exe`，把「驱动层是否真的工作」交给真机一次性判定，
+不再用 mock 通过数冒充可上网。
 
 ### beta0.1.6 — 修掉「UDP 回包冻结」与「手机 SOCKS5 并发饱和导致的秒断/卡顿」
 

@@ -1,0 +1,27 @@
+; LinkHelm-exp optional policy switches.
+; Copy to the folder containing LinkHelmExp.exe and rename to exp_policy.ini.
+; ABSENT file = defaults below (beta0.1.6 behaviour). Each switch is
+; independently revertible; change ONE at a time and keep the log.
+[LinkHelm-exp]
+
+; UDP/443 (QUIC, some games): proxy = offer to SOCKS5 UDP ASSOCIATE (default)
+;                            drop  = explicitly discard and count
+Udp443=proxy
+
+; Global IPv6 egress: block = fail-closed (default, phone SOCKS5 is IPv4-only)
+;                     allow = compatibility test only
+IPv6=block
+
+; AAAA DNS replies: suppress = NOERROR/empty (default, forces IPv4)
+;                   allow    = query upstream normally (test only)
+Aaaa=suppress
+
+; Add an inbound firewall allow rule for this exe on ALL profiles.
+; Needs elevation. Public-classified adapters can silently drop the
+; redirected SYN without it. Default 0 = detect/report only.
+FirewallInboundAllow=0
+
+; Max concurrent SOCKS5 CONNECT handshakes. 0 = adaptive AIMD (default,
+; starts at 8, halves on phone saturation, +1 after 16 successes).
+; Fixed 1..64 for controlled experiments.
+ConnectConcurrency=0

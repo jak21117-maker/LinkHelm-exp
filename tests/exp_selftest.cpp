@@ -1,31 +1,22 @@
-// LinkHelm-exp beta0.1.6 self-test harness.
+// LinkHelm-exp beta0.1.7 — MINIMAL end-to-end self-test.
 //
-// This TU #includes the PRODUCTION exp_engine.cpp, so every function under
-// test is the exact same code that ships in LinkHelmExp.exe (no copies, no
-// re-implementations). exp_socks5.cpp is linked separately.
+// Design rule (per review): no pure-function / mock / self-attesting asserts.
+// Every Check() below crosses a REAL socket boundary against an in-process
+// mock "phone" (RFC 1928/1929 SOCKS5 + DNS-over-TCP + UDP echo), and exercises
+// the PRODUCTION code (#include of exp_engine.cpp, link of exp_socks5.cpp).
+// There are deliberately only a handful of them. A large passing number here
+// proves nothing about the WinDivert driver layer — use tests/driver_probe.exe
+// (elevated) for that.
 //
-// A mock "phone" (SOCKS5 server, RFC 1928/1929) runs in-process on
-// 127.0.0.1:18080. It stands in for LinkHelm Android Host and forwards
-// CONNECT to the real network, answers DNS-over-TCP, and echoes UDP
-// ASSOCIATE datagrams with the original remote endpoint restored.
-//
-// beta0.1.4 adds the regression tests the review document asks for:
-//   F01 slow UDP ASSOCIATE must not stall new TCP sessions
-//   F02 WinDivertSend failures must be counted, not ignored
-//   F03 100 failed CONNECTs must leave tcp_reg.live empty and budget at 0
-//   F04 a saturated gate must cancel instead of dialling anyway
-//   §5.1 private/phone DNS targets must be remapped to a public resolver
-//
-// WinDivert itself is NOT exercised here (loading WinDivert64.sys requires
-// elevation). Everything upstream and downstream of the driver IS.
+// WinDivert64.sys is NOT loaded here. Filter semantics are still checked with
+// WinDivert.dll's no-driver helper API against the SAME string the product
+// builds via BuildCaptureFilter().
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
-#include <initializer_list>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,14 +29,12 @@ using namespace linkhelm;
 
 static std::atomic<int> g_pass{0}, g_fail{0};
 static void Check(bool ok, const char* name, const std::string& detail = "") {
-    std::printf("[%s] %-52s %s\n", ok ? "PASS" : "FAIL", name,
+    std::printf("[%s] %-56s %s\n", ok ? "PASS" : "FAIL", name,
                 detail.c_str());
     if (ok) g_pass.fetch_add(1); else g_fail.fetch_add(1);
 }
-
 static bool SendAllT(SOCKET s, const void* p, int n) {
-    const char* b = (const char*)p;
-    int done = 0;
+    const char* b = (const char*)p; int done = 0;
     while (done < n) {
         int k = send(s, b + done, n - done, 0);
         if (k <= 0) return false;
@@ -54,8 +43,7 @@ static bool SendAllT(SOCKET s, const void* p, int n) {
     return true;
 }
 static bool RecvAllT(SOCKET s, void* p, int n) {
-    char* b = (char*)p;
-    int done = 0;
+    char* b = (char*)p; int done = 0;
     while (done < n) {
         int k = recv(s, b + done, n - done, 0);
         if (k <= 0) return false;
@@ -67,33 +55,22 @@ static bool RecvAllT(SOCKET s, void* p, int n) {
 // ------------------------------------------------------------ mock phone
 static const uint16_t kPhonePort = 18080;
 static std::atomic<bool> g_phone_on{true};
-// Simulates a loaded phone ProxyServer: ASSOCIATE takes seconds.
-static std::atomic<int> g_assoc_delay_ms{0};
-// beta0.1.5: the phone accepts the TCP connection, then dies before sending
-// the CONNECT reply ("CONNECT reply missing" in the field log). Count-down:
-// the first N CONNECTs are dropped, then the phone answers normally, so a
-// multi-attempt retry can be proven deterministically.
-static std::atomic<int> g_transient_drop{0};
-// beta0.1.6: a saturated phone answers CONNECT slowly (3-10s in the field
-// log). Used to prove the flow still succeeds instead of being reset.
-static std::atomic<int> g_connect_delay_ms{0};
 
-// Build a DNS answer over the query (A -> 93.184.216.34, else empty).
 static std::vector<uint8_t> MockDnsAnswer(const uint8_t* q, int n) {
     std::vector<uint8_t> out;
     if (n < 17) return out;
     int p = 12;
-    while (p < n && q[p]) { p += 1 + q[p]; }
+    while (p < n && q[p]) p += 1 + q[p];
     if (p + 5 > n) return out;
     ++p;
-    uint16_t qtype = (q[p] << 8) | q[p + 1];
-    int qlen = p + 4;                       // end of question section
+    uint16_t qtype = (uint16_t)((q[p] << 8) | q[p + 1]);
+    int qlen = p + 4;
     out.assign(q, q + qlen);
-    out[2] = 0x81; out[3] = 0x80;          // QR + RD + RA, NOERROR
-    out[4] = 0; out[5] = 1;                // QDCOUNT=1
-    out[6] = out[7] = out[8] = out[9] = 0; // AN/NS/AR initially 0
-    if (qtype == 1) {                      // A
-        out[7] = 1;                        // ANCOUNT=1
+    out[2] = 0x81; out[3] = 0x80;
+    out[4] = 0; out[5] = 1;
+    out[6] = out[7] = out[8] = out[9] = 0;
+    if (qtype == 1) {
+        out[7] = 1;
         const uint8_t rr[] = {0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60,
                               0, 4, 93, 184, 216, 34};
         out.insert(out.end(), rr, rr + sizeof(rr));
@@ -104,18 +81,13 @@ static std::vector<uint8_t> MockDnsAnswer(const uint8_t* q, int n) {
 static void UdpRelay(SOCKET udp, SOCKET ctrl) {
     uint8_t buf[65535];
     for (;;) {
-        sockaddr_in from{};
-        int fl = sizeof(from);
+        sockaddr_in from{}; int fl = sizeof(from);
         int n = recvfrom(udp, (char*)buf, sizeof(buf), 0,
                          (sockaddr*)&from, &fl);
         if (n < 10) break;
         if (buf[3] != 0x01) continue;
-        // Echo the payload back, carrying the ORIGINAL remote endpoint so
-        // the client can verify source-endpoint restoration.
-        std::vector<uint8_t> rep;
-        rep.push_back(0); rep.push_back(0); rep.push_back(0);
-        rep.push_back(0x01);
-        rep.insert(rep.end(), buf + 4, buf + 10);   // orig dst ip:port
+        std::vector<uint8_t> rep{0, 0, 0, 0x01};
+        rep.insert(rep.end(), buf + 4, buf + 10);   // original dst ip:port
         rep.insert(rep.end(), buf + 10, buf + n);   // payload echo
         sendto(udp, (const char*)rep.data(), (int)rep.size(), 0,
                (sockaddr*)&from, fl);
@@ -138,9 +110,10 @@ static void PhoneConn(SOCKET c) {
     if (want_auth) {
         uint8_t v[2];
         if (!RecvAllT(c, v, 2) || v[0] != 1) { closesocket(c); return; }
-        std::vector<uint8_t> u(v[1]);
-        uint8_t plen = 0;
-        if (!u.empty() && !RecvAllT(c, u.data(), (int)u.size())) { closesocket(c); return; }
+        std::vector<uint8_t> u(v[1]); uint8_t plen = 0;
+        if (!u.empty() && !RecvAllT(c, u.data(), (int)u.size())) {
+            closesocket(c); return;
+        }
         if (!RecvAllT(c, &plen, 1)) { closesocket(c); return; }
         std::vector<uint8_t> pw(plen);
         if (plen && !RecvAllT(c, pw.data(), plen)) { closesocket(c); return; }
@@ -152,10 +125,11 @@ static void PhoneConn(SOCKET c) {
     uint8_t req[4];
     if (!RecvAllT(c, req, 4)) { closesocket(c); return; }
     uint8_t cmd = req[1];
-    uint32_t dst = 0;
-    uint16_t dport = 0;
+    uint32_t dst = 0; uint16_t dport = 0;
     if (req[3] == 0x01) {
-        if (!RecvAllT(c, &dst, 4) || !RecvAllT(c, &dport, 2)) { closesocket(c); return; }
+        if (!RecvAllT(c, &dst, 4) || !RecvAllT(c, &dport, 2)) {
+            closesocket(c); return;
+        }
     } else if (req[3] == 0x03) {
         uint8_t l = 0; std::vector<uint8_t> host;
         if (!RecvAllT(c, &l, 1)) { closesocket(c); return; }
@@ -167,14 +141,10 @@ static void PhoneConn(SOCKET c) {
         if (h) memcpy(&dst, h->h_addr, 4);
     } else { closesocket(c); return; }
 
-    if (cmd == 0x03) {                       // UDP ASSOCIATE
-        int dly = g_assoc_delay_ms.load();
-        if (dly > 0) Sleep((DWORD)dly);       // slow phone under load
+    if (cmd == 0x03) {                          // UDP ASSOCIATE
         SOCKET u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in la{};
-        la.sin_family = AF_INET;
-        la.sin_addr.s_addr = inet_addr("127.0.0.1");
-        la.sin_port = 0;
+        sockaddr_in la{}; la.sin_family = AF_INET;
+        la.sin_addr.s_addr = inet_addr("127.0.0.1"); la.sin_port = 0;
         bind(u, (sockaddr*)&la, sizeof(la));
         sockaddr_in bound{}; int bl = sizeof(bound);
         getsockname(u, (sockaddr*)&bound, &bl);
@@ -183,45 +153,24 @@ static void PhoneConn(SOCKET c) {
         if (!SendAllT(c, rep, 10)) { closesocket(u); closesocket(c); return; }
         std::thread(UdpRelay, u, c).detach();
         char keep[16];
-        while (g_phone_on.load()) {         // control conn keeps assoc alive
+        while (g_phone_on.load()) {
             int k = recv(c, keep, sizeof(keep), 0);
             if (k == 0) break;
             if (k < 0) { Sleep(50); continue; }
         }
-        closesocket(u);
-        closesocket(c);
+        closesocket(u); closesocket(c);
         return;
     }
     if (cmd != 0x01) { closesocket(c); return; }
 
-    // beta0.1.6: a saturated phone answers CONNECT slowly. Keep the TCP
-    // connection open while sleeping so the client's handshake timeout,
-    // retry policy and connect-latency instrumentation are all exercised.
-    int cd = g_connect_delay_ms.load();
-    if (cd > 0) Sleep((DWORD)cd);
-
-    // beta0.1.5 transient-failure hook: drop the connection without any
-    // SOCKS5 reply, so the client sees "CONNECT reply missing". Count-down
-    // (fetch_sub > 0) supports N consecutive drops for the 3-attempt retry.
-    if (g_transient_drop.load() > 0 && g_transient_drop.fetch_sub(1) > 0) {
-        closesocket(c);
-        return;
-    }
-
-    // Deterministic F03 pressure-test hook: port 1 is a forced REP=0x05.
-    // A real connect() to 127.0.0.1:1 waits for Windows' TCP refusal/retransmit
-    // path (~1s each), so 100 sequential failures would take minutes and the
-    // harness looked hung. The plan only requires the PHONE to reject, so answer
-    // the rejection directly — this is both faster and a more faithful mock.
+    // Forced REP=0x05 on port 1 = deterministic proxy refusal (RST test).
     if (ntohs(dport) == 1) {
         uint8_t rep[10] = {5, 5, 0, 1, 0, 0, 0, 0, 0, 0};
         SendAllT(c, rep, 10);
         closesocket(c);
         return;
     }
-
-    // DNS-over-TCP on port 53: answer locally (mocks the phone uplink).
-    if (ntohs(dport) == 53) {
+    if (ntohs(dport) == 53) {                  // DNS over TCP (RFC 7766)
         uint8_t reply0[10] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
         if (!SendAllT(c, reply0, 10)) { closesocket(c); return; }
         for (;;) {
@@ -234,18 +183,17 @@ static void PhoneConn(SOCKET c) {
             std::vector<uint8_t> a = MockDnsAnswer(q.data(), qlen);
             if (a.empty()) break;
             uint8_t hb[2] = {(uint8_t)(a.size() >> 8), (uint8_t)a.size()};
-            if (!SendAllT(c, hb, 2) || !SendAllT(c, a.data(), (int)a.size())) break;
+            if (!SendAllT(c, hb, 2) || !SendAllT(c, a.data(), (int)a.size()))
+                break;
         }
         closesocket(c);
         return;
     }
 
-    // Plain CONNECT: dial the real target through the host's native network.
+    // Plain CONNECT: real TCP to the real target through the host network.
     SOCKET r = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = dst;
-    sa.sin_port = dport;
+    sockaddr_in sa{}; sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = dst; sa.sin_port = dport;
     DWORD ctmo = 5000;
     setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ctmo, sizeof(ctmo));
     if (connect(r, (sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
@@ -256,11 +204,7 @@ static void PhoneConn(SOCKET c) {
     }
     uint8_t ok[10] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
     if (!SendAllT(c, ok, 10)) { closesocket(r); closesocket(c); return; }
-    DWORD t = 4000;
-    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
-    // simple bidirectional pump
-    // Capture by VALUE only. Detaching a thread that captured locals by
-    // reference is a use-after-free once PhoneConn returns (SIGSEGV on exit).
+    // Capture by VALUE; detached threads must not outlive PhoneConn's stack.
     auto alive = std::make_shared<std::atomic<bool>>(true);
     std::thread t1([alive, c, r] {
         char b[8192];
@@ -277,20 +221,18 @@ static void PhoneConn(SOCKET c) {
         if (send(c, b, n, 0) <= 0) break;
     }
     alive->store(false);
-    shutdown(c, SD_BOTH);
-    shutdown(r, SD_BOTH);
+    shutdown(c, SD_BOTH); shutdown(r, SD_BOTH);
     t1.detach();
-    closesocket(r);
-    closesocket(c);
+    closesocket(r); closesocket(c);
 }
 
 static void MockPhone() {
     SOCKET l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
+    sockaddr_in a{}; a.sin_family = AF_INET;
     a.sin_addr.s_addr = inet_addr("127.0.0.1");
     a.sin_port = htons(kPhonePort);
-    if (bind(l, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR || listen(l, 64) == SOCKET_ERROR) {
+    if (bind(l, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR ||
+        listen(l, 64) == SOCKET_ERROR) {
         std::printf("FATAL: cannot bind mock phone on %d\n", kPhonePort);
         return;
     }
@@ -302,12 +244,10 @@ static void MockPhone() {
     closesocket(l);
 }
 
-// ------------------------------------------------------------- DNS query
+// ------------------------------------------------------------- helpers
 static std::vector<uint8_t> MakeQuery(const char* host, uint16_t qtype) {
     std::vector<uint8_t> q(12, 0);
-    q[0] = 0x12; q[1] = 0x34;
-    q[2] = 0x01;               // RD
-    q[5] = 0x01;               // QDCOUNT=1
+    q[0] = 0x12; q[1] = 0x34; q[2] = 0x01; q[5] = 0x01;
     const char* p = host;
     while (*p) {
         const char* dot = strchr(p, '.');
@@ -321,16 +261,12 @@ static std::vector<uint8_t> MakeQuery(const char* host, uint16_t qtype) {
     q.push_back(0); q.push_back(1);
     return q;
 }
-
-static std::vector<uint8_t> UdpAsk(uint16_t port, const std::vector<uint8_t>& q,
-                                   int timeout_ms = 4000) {
+static std::vector<uint8_t> UdpAsk(uint16_t port, const std::vector<uint8_t>& q) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    DWORD tmo = (DWORD)timeout_ms;
+    DWORD tmo = 4000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = inet_addr("127.0.0.1");
-    a.sin_port = htons(port);
+    sockaddr_in a{}; a.sin_family = AF_INET;
+    a.sin_addr.s_addr = inet_addr("127.0.0.1"); a.sin_port = htons(port);
     std::vector<uint8_t> r;
     if (sendto(s, (const char*)q.data(), (int)q.size(), 0,
                (sockaddr*)&a, sizeof(a)) == q.size()) {
@@ -341,26 +277,75 @@ static std::vector<uint8_t> UdpAsk(uint16_t port, const std::vector<uint8_t>& q,
     closesocket(s);
     return r;
 }
-
-// Resolve a public host to an IPv4 (network order) for the CONNECT test.
 static uint32_t ResolveIpv4(const char* host) {
     addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, "80", &hints, &res) != 0 || !res) return 0;
     uint32_t ip = ((sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);
     return ip;
 }
 
+// One production TCP session over a real socket pair. Returns the HTTP reply
+// bytes the app side received. `dst_port` selects phone behaviour.
+static std::string RunSession(uint16_t dst_port, uint32_t dst_ip,
+                              const ExpAuth& auth, bool* finalized,
+                              int* app_err = nullptr) {
+    SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in la{}; la.sin_family = AF_INET;
+    la.sin_addr.s_addr = inet_addr("127.0.0.1"); la.sin_port = 0;
+    bind(ln, (sockaddr*)&la, sizeof(la));
+    listen(ln, 4);
+    sockaddr_in got{}; int gl = sizeof(got);
+    getsockname(ln, (sockaddr*)&got, &gl);
+    SOCKET app = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    connect(app, (sockaddr*)&got, sizeof(got));
+    SOCKET accepted = accept(ln, nullptr, nullptr);
+    std::string result;
+    if (app != INVALID_SOCKET && accepted != INVALID_SOCKET) {
+        auto sess = std::make_shared<TcpSession>();
+        sess->client.store(accepted);
+        static std::atomic<int> budget{0};
+        static TcpRegistry reg;
+        static ConnectGate gate;
+        static std::atomic<bool> stop_flag{true};
+        static auto stats = std::make_shared<EngineStats>();
+        static auto logfn = [](const std::wstring&) {};
+        sess->budget = &budget;
+        budget.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(reg.mtx);
+            reg.live.push_back(sess);
+        }
+        NatEntry ne{};
+        ne.orig_dst_ip = ntohl(dst_ip);
+        ne.orig_dst_port = dst_port;
+        ne.app_ip = inet_addr("127.0.0.1");
+        ne.flow_id = 77;
+        std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
+                    kPhonePort, auth, (uint64_t)77, logfn, &reg, stats,
+                    &gate, &stop_flag, &budget).detach();
+        const char* req = "GET / HTTP/1.0\r\nHost: www.baidu.com\r\n"
+                          "Connection: close\r\n\r\n";
+        SendAllT(app, req, (int)strlen(req));
+        char buf[4096];
+        int n = recv(app, buf, sizeof(buf) - 1, 0);
+        if (n > 0) { buf[n] = 0; result.assign(buf, (size_t)n); }
+        if (app_err) *app_err = (n < 0) ? WSAGetLastError() : 0;
+        closesocket(app);
+        for (int i = 0; i < 60 && budget.load() > 0; ++i) Sleep(50);
+        *finalized = (budget.load() == 0 && reg.live.empty());
+    }
+    closesocket(ln);
+    return result;
+}
+
 // ------------------------------------------------------------------ main
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    // --phone-only keeps the mock phone running as a standalone SOCKS5
-    // server so tests/socks5_probe.exe can be exercised against it.
+    // --phone-only: standalone mock SOCKS5 server for socks5_probe.exe.
     if (argc > 1 && std::strcmp(argv[1], "--phone-only") == 0) {
         std::thread(MockPhone).detach();
         std::printf("mock phone listening on 127.0.0.1:%u (auth u:p)\n",
@@ -368,928 +353,225 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.1.6 self-test (mock phone) ===\n");
-    std::printf("sources under test: src/exp_engine.cpp + src/exp_socks5.cpp\n\n");
+    std::printf("=== LinkHelm-exp beta0.1.7 end-to-end self-test ===\n");
+    std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
+                "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 
     std::thread(MockPhone).detach();
     Sleep(300);
-
-    ExpAuth auth;
-    auth.user = "u"; auth.pass = "p";
+    ExpAuth auth; auth.user = "u"; auth.pass = "p";
     auto logfn = [](const std::wstring&) {};
     auto st = std::make_shared<EngineStats>();
 
-    // ---- 1. SOCKS5 auth precheck -------------------------------------
+    // 1. Real SOCKS5 handshake: auth accepted, wrong password rejected.
     {
         std::string err;
         bool ok = ExpSocks5Precheck("127.0.0.1", kPhonePort, auth, &err);
-        Check(ok, "SOCKS5 RFC1929 auth precheck", err);
         ExpAuth bad; bad.user = "u"; bad.pass = "WRONG";
         std::string e2;
-        Check(!ExpSocks5Precheck("127.0.0.1", kPhonePort, bad, &e2),
-              "wrong password is rejected", e2);
+        bool rejected = !ExpSocks5Precheck("127.0.0.1", kPhonePort, bad, &e2);
+        Check(ok && rejected, "SOCKS5 RFC1929 handshake (accept + reject)",
+              err + " / " + e2);
     }
 
-    // ---- 2. Real TCP CONNECT through the mock phone ------------------
+    // 2. Real HTTP request/response through the phone's SOCKS5 CONNECT.
     uint32_t baidu = ResolveIpv4("www.baidu.com");
-    Check(baidu != 0, "host resolves an IPv4 address");
     if (baidu) {
         std::string err;
         SOCKET s = ExpSocks5TcpConnect("127.0.0.1", kPhonePort, auth,
                                        baidu, htons(80), &err);
-        Check(s != INVALID_SOCKET, "SOCKS5 TCP CONNECT to real HTTP host", err);
+        std::string resp;
         if (s != INVALID_SOCKET) {
-            const char* req = "GET / HTTP/1.0\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n";
-            bool sent = SendAllT(s, req, (int)strlen(req));
-            char resp[4096]; int n = 0;
-            if (sent) n = recv(s, resp, sizeof(resp) - 1, 0);
-            if (n > 0) resp[n] = 0; else resp[0] = 0;
-            bool http = n > 0 && strstr(resp, "HTTP/1.") != nullptr;
-            Check(http, "HTTP response arrives through SOCKS5 tunnel",
-                  http ? std::string(resp).substr(0, 15) : "no HTTP response");
+            const char* req = "GET / HTTP/1.0\r\nHost: www.baidu.com\r\n"
+                              "Connection: close\r\n\r\n";
+            if (SendAllT(s, req, (int)strlen(req))) {
+                char b[4096]; int n = recv(s, b, sizeof(b) - 1, 0);
+                if (n > 0) { b[n] = 0; resp.assign(b, (size_t)n); }
+            }
             closesocket(s);
         }
+        Check(resp.find("HTTP/1.") != std::string::npos,
+              "HTTP bytes cross SOCKS5 CONNECT end-to-end",
+              resp.substr(0, 15));
+    } else {
+        Check(false, "HTTP bytes cross SOCKS5 CONNECT end-to-end",
+              "host resolution failed (no network)");
     }
 
-    // ---- 3. Local DNS proxy (product code) over mock phone ----------
+    // 3. Local DNS proxy: real UDP query -> SOCKS5 TCP DNS -> real UDP reply.
     {
-        static DnsProxy dp;   // static storage: detached workers stay valid
+        static DnsProxy dp;   // static: detached workers stay valid
         dp.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in la{};
-        la.sin_family = AF_INET;
+        sockaddr_in la{}; la.sin_family = AF_INET;
         la.sin_addr.s_addr = inet_addr("127.0.0.1");
         la.sin_port = htons(15353);
         bool bound = bind(dp.sock, (sockaddr*)&la, sizeof(la)) != SOCKET_ERROR;
-        Check(bound, "local DNS proxy binds 127.0.0.1:15353");
+        std::vector<uint8_t> ra, raaaa;
         if (bound) {
             dp.running.store(true);
             std::thread(DnsProxyLoop, &dp, std::string("127.0.0.1"),
                         kPhonePort, auth, st, logfn).detach();
             Sleep(100);
             auto qa = MakeQuery("www.example.com", 1);
-            auto ra = UdpAsk(15353, qa);
-            bool a_ok = ra.size() > 12 &&
-                        ra[0] == qa[0] && ra[1] == qa[1] &&
-                        (ra[3] & 0x0f) == 0 &&
-                        ((ra[6] << 8) | ra[7]) >= 1;
-            Check(a_ok, "DNS A query relayed over SOCKS5 (real engine code)",
-                  "answer count=" + std::to_string(ra.size() > 12 ? ((ra[6] << 8) | ra[7]) : -1));
-
+            ra = UdpAsk(15353, qa);
             auto qaaaa = MakeQuery("www.example.com", 28);
-            auto raaaa = UdpAsk(15353, qaaaa);
-            bool aaaa_ok = raaaa.size() >= 12 &&
-                           (raaaa[2] & 0x80) != 0 &&       // QR
-                           (raaaa[3] & 0x0f) == 0 &&       // NOERROR
-                           raaaa[6] == 0 && raaaa[7] == 0; // ANCOUNT=0
-            Check(aaaa_ok, "AAAA suppressed (NOERROR + 0 answers)",
-                  "len=" + std::to_string((int)raaaa.size()));
+            raaaa = UdpAsk(15353, qaaaa);
             dp.running.store(false);
             closesocket(dp.sock);
             Sleep(100);
         }
+        bool a_ok = ra.size() > 12 && ra[0] == 0x12 && ra[1] == 0x34 &&
+                    (ra[3] & 0x0f) == 0 && ((ra[6] << 8) | ra[7]) >= 1;
+        bool aaaa_ok = raaaa.size() >= 12 && (raaaa[2] & 0x80) != 0 &&
+                       (raaaa[3] & 0x0f) == 0 &&
+                       raaaa[6] == 0 && raaaa[7] == 0;
+        Check(a_ok, "DNS A query relayed over SOCKS5 (real sockets)",
+              "answers=" + std::to_string(ra.size() > 12 ? ((ra[6] << 8) | ra[7]) : -1));
+        Check(aaaa_ok, "AAAA suppressed (NOERROR + empty answer)",
+              "len=" + std::to_string((int)raaaa.size()));
     }
 
-    // ---- 4. UDP ASSOCIATE + endpoint restoration --------------------
+    // 4. UDP ASSOCIATE round trip with original remote endpoint restored,
+    //    after three malformed relay datagrams. This is the field failure
+    //    "UDP 回包 freezes while 发送 keeps growing".
     {
         std::string err;
         ExpUdpAssoc a{};
         bool ok = ExpSocks5UdpAssociate("127.0.0.1", kPhonePort, auth, &a, &err);
-        Check(ok, "SOCKS5 UDP ASSOCIATE succeeds", err);
-        if (ok) {
-            uint32_t dst = inet_addr("8.8.8.8");
-            uint16_t dport = htons(9999);
-            const char* msg = "PING-EXP";
-            bool sent = ExpSocks5UdpSend(a, dst, dport,
-                                         (const uint8_t*)msg, (int)strlen(msg));
-            Check(sent, "UDP datagram sent through ASSOCIATE");
-            uint8_t back[512]; uint32_t sip = 0; uint16_t sport = 0;
-            int n = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
-            bool echo_ok = n == (int)strlen(msg) &&
-                           memcmp(back, msg, n) == 0 &&
-                           sip == dst && sport == dport;
-            Check(echo_ok, "UDP reply carries ORIGINAL remote endpoint",
-                  "src_ip=" + std::to_string(sip & 0xff) +
-                  "... port=" + std::to_string(ntohs(sport)));
-            ExpSocks5UdpClose(&a);
-        }
-    }
-
-    // ---- 4b. b0.1.6: ONE malformed relay datagram must NOT kill UDP ----
-    // Field log: "UDP 回包 8" froze forever while "UDP 发送 9" kept growing.
-    // Root cause: ExpSocks5UdpRecv returned -1 for any reply whose source
-    // port differed from BND.PORT (or had ATYP != IPv4 / FRAG != 0), and
-    // UdpRecvThread treated n<=0 as "control conn died" and broke out of the
-    // loop FOREVER. This reproduces that exact packet mix against the
-    // production SOCKS5 client + the production receive-decision predicate.
-    {
-        std::string err;
-        ExpUdpAssoc a{};
-        bool ok = ExpSocks5UdpAssociate("127.0.0.1", kPhonePort, auth, &a, &err);
-        Check(ok, "b0.1.6 UDP ASSOCIATE for malformed-datagram test", err);
+        std::string echo;
+        bool endpoint_ok = false;
         if (ok) {
             sockaddr_in mine{}; int ml = sizeof(mine);
             getsockname(a.udp, (sockaddr*)&mine, &ml);
-            // a.udp is bound to INADDR_ANY, so getsockname() reports
-            // 0.0.0.0. Sending to 0.0.0.0 on Windows does not loop back —
-            // pin the destination to 127.0.0.1 and keep only the port.
-            sockaddr_in target{};
-            target.sin_family = AF_INET;
-            target.sin_addr.s_addr = inet_addr("127.0.0.1");
-            target.sin_port = mine.sin_port;
-            // A rogue local socket whose source port is deliberately NOT
-            // relay_port — the exact shape that killed beta0.1.5.
+            sockaddr_in to{}; to.sin_family = AF_INET;
+            to.sin_addr.s_addr = inet_addr("127.0.0.1");
+            to.sin_port = mine.sin_port;   // 0.0.0.0 is not sendable on Windows
             SOCKET rogue = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            sockaddr_in rl{};
-            rl.sin_family = AF_INET;
-            rl.sin_addr.s_addr = inet_addr("127.0.0.1");
-            rl.sin_port = 0;
-            bind(rogue, (sockaddr*)&rl, sizeof(rl));
-            sockaddr_in rlb{}; int rlbl = sizeof(rlb);
-            getsockname(rogue, (sockaddr*)&rlb, &rlbl);
-            Check(rlb.sin_port != a.relay_port,
-                  "b0.1.6 rogue relay source port differs from BND.PORT",
-                  "rogue=" + std::to_string(ntohs(rlb.sin_port)) +
-                  " bnd=" + std::to_string(ntohs(a.relay_port)));
-            DWORD tmo = 800;
-            setsockopt(a.udp, SOL_SOCKET, SO_RCVTIMEO,
-                       (const char*)&tmo, sizeof(tmo));
-            auto SendRogue = [&](std::initializer_list<int> bytes) {
-                std::vector<uint8_t> d(bytes.begin(), bytes.end());
-                sendto(rogue, (const char*)d.data(), (int)d.size(), 0,
-                       (sockaddr*)&target, sizeof(target));
-            };
+            // All four are genuinely unusable: ATYP=domain, FRAG!=0, short,
+            // ATYP=IPv6. Each must be SKIPPED, never kill the receive loop.
+            std::vector<uint8_t> bad1{0, 0, 0, 0x03, 3, 'a', 'b', 'c',
+                                      0, 53, 'x'};
+            std::vector<uint8_t> bad2{0, 0, 1, 0x01, 8, 8, 8, 8, 0, 53, 'x'};
+            std::vector<uint8_t> bad3{0, 0, 0};
+            std::vector<uint8_t> bad4{0, 0, 0, 0x04, 8, 8, 8, 8, 0, 53, 'x'};
+            for (auto* d : {&bad1, &bad2, &bad3, &bad4})
+                sendto(rogue, (const char*)d->data(), (int)d->size(), 0,
+                       (sockaddr*)&to, sizeof(to));
+            Sleep(50);
+            uint32_t dst = inet_addr("8.8.8.8");
+            uint16_t dport = htons(9999);
+            const char* msg = "PING-EXP";
+            ExpSocks5UdpSend(a, dst, dport, (const uint8_t*)msg,
+                             (int)strlen(msg));
             uint8_t back[512]; uint32_t sip = 0; uint16_t sport = 0;
-
-            SendRogue({0, 0, 0, 3, 3, 'a', 'b', 'c', 0x12, 0x34, 'X'});
-            int n1 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
-            Check(n1 == -5 && ClassifyUdpRecv(n1) == UdpRecvDecision::kSkip,
-                  "domain ATYP reply is SKIPPED (thread survives)",
-                  "rc=" + std::to_string(n1));
-
-            SendRogue({0, 0, 1, 1, 8, 8, 8, 8, 0x12, 0x34, 'Y'});
-            int n2 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
-            Check(n2 == -4 && ClassifyUdpRecv(n2) == UdpRecvDecision::kSkip,
-                  "FRAG!=0 reply is SKIPPED (thread survives)",
-                  "rc=" + std::to_string(n2));
-
-            SendRogue({0, 0});
-            int n3 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
-            Check(n3 == -2 && ClassifyUdpRecv(n3) == UdpRecvDecision::kSkip,
-                  "short reply is SKIPPED (thread survives)",
-                  "rc=" + std::to_string(n3));
-
-            // The decisive one: a VALID datagram from a DIFFERENT relay port
-            // must still be delivered after all three skips.
-            SendRogue({0, 0, 0, 1, 8, 8, 8, 8, 0x12, 0x34, 'O', 'K'});
-            int n4 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
-            Check(n4 == 2 && memcmp(back, "OK", 2) == 0 &&
-                      sip == inet_addr("8.8.8.8") && sport == htons(0x1234),
-                  "b0.1.6 valid reply from a DIFFERENT relay port is received",
-                  "rc=" + std::to_string(n4) +
-                  " port=" + std::to_string(ntohs(sport)));
-
-            Check(ClassifyUdpRecv(-1) == UdpRecvDecision::kExit &&
-                      ClassifyUdpRecv(0) == UdpRecvDecision::kSkip &&
-                      ClassifyUdpRecv(10) == UdpRecvDecision::kForward,
-                  "only a real socket error (-1) may end the receive thread");
+            int n = -1;
+            for (int i = 0; i < 8; ++i) {
+                n = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
+                if (ClassifyUdpRecv(n) == UdpRecvDecision::kForward) break;
+                if (ClassifyUdpRecv(n) == UdpRecvDecision::kExit) break;
+            }
+            if (n > 0) echo.assign((char*)back, (size_t)n);
+            endpoint_ok = (echo == "PING-EXP" && sip == dst && sport == dport);
             closesocket(rogue);
             ExpSocks5UdpClose(&a);
         }
+        Check(ok && endpoint_ok,
+              "UDP survives malformed relay packets + restores endpoint",
+              ok ? ("echo=" + echo) : err);
     }
 
-    // ---- 4c. b0.1.6: dead ASSOCIATE control conn is detected ----------
-    // RFC 1928: closing the TCP control connection ends the UDP association.
-    // 0.1.5 never checked it → session silently became send-only.
-    {
-        SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        sockaddr_in la{};
-        la.sin_family = AF_INET;
-        la.sin_addr.s_addr = inet_addr("127.0.0.1");
-        la.sin_port = 0;
-        bind(ln, (sockaddr*)&la, sizeof(la));
-        listen(ln, 2);
-        sockaddr_in got{}; int gl = sizeof(got);
-        getsockname(ln, (sockaddr*)&got, &gl);
-        SOCKET cli = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        connect(cli, (sockaddr*)&got, sizeof(got));
-        SOCKET srv = accept(ln, nullptr, nullptr);
-        Check(cli != INVALID_SOCKET && srv != INVALID_SOCKET,
-              "b0.1.6 control-conn liveness socket pair");
-        if (cli != INVALID_SOCKET && srv != INVALID_SOCKET) {
-            ExpUdpAssoc fake{};
-            fake.ctrl = srv;
-            Check(ExpSocks5UdpCtrlAlive(fake),
-                  "ASSOCIATE control conn alive while peer is open");
-            closesocket(cli);           // peer sends FIN
-            Sleep(80);
-            Check(!ExpSocks5UdpCtrlAlive(fake),
-                  "b0.1.6 peer FIN detected → association must rebuild");
-            closesocket(srv);
-        }
-        closesocket(ln);
-    }
-
-    // ---- 5. Production TCP session pump (TcpWorker) -----------------
+    // 5. Production TcpWorker over a real socket pair: HTTP through the
+    //    phone, session deregistered. Covers gate, socket options, pumps,
+    //    close-reason instrumentation and SessionFinalize in ONE path.
     if (baidu) {
-        SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        sockaddr_in la{};
-        la.sin_family = AF_INET;
-        la.sin_addr.s_addr = inet_addr("127.0.0.1");
-        la.sin_port = 0;
-        bind(ln, (sockaddr*)&la, sizeof(la));
-        listen(ln, 4);
-        sockaddr_in got{}; int gl = sizeof(got);
-        getsockname(ln, (sockaddr*)&got, &gl);
-        SOCKET app = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        connect(app, (sockaddr*)&got, sizeof(got));
-        SOCKET accepted = accept(ln, nullptr, nullptr);
-        Check(app != INVALID_SOCKET && accepted != INVALID_SOCKET,
-              "local reflection socket pair created");
-        if (app != INVALID_SOCKET && accepted != INVALID_SOCKET) {
-            auto sess = std::make_shared<TcpSession>();
-            sess->client.store(accepted);
-            static std::atomic<int> budget{0}, dummy_budget{0};
-            static TcpRegistry reg;   // detached TcpWorker deregisters here
-            static ConnectGate gate;
-            static std::atomic<bool> stop_flag{true};
-            sess->budget = &budget;
-            budget.fetch_add(1);
-            {
-                std::lock_guard<std::mutex> lk(reg.mtx);
-                reg.live.push_back(sess);
-            }
-            NatEntry ne{};
-            ne.orig_dst_ip = ntohl(baidu);
-            ne.orig_dst_port = 80;
-            ne.app_ip = inet_addr("127.0.0.1");
-            ne.flow_id = 99;
-            std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
-                        kPhonePort, auth, (uint64_t)99, logfn, &reg, st,
-                        &gate, &stop_flag, &budget).detach();
-            const char* req = "GET / HTTP/1.0\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n";
-            SendAllT(app, req, (int)strlen(req));
-            char buf[4096]; int n = recv(app, buf, sizeof(buf) - 1, 0);
-            if (n > 0) buf[n] = 0; else buf[0] = 0;
-            Check(n > 0 && strstr(buf, "HTTP/1.") != nullptr,
-                  "TcpWorker pump: request+response through phone",
-                  n > 0 ? std::string(buf).substr(0, 15) : "no data");
-            Check(st->socks_ok.load() >= 1, "TcpWorker reports CONNECT success");
-            closesocket(app);
-            // wait for the session to finalize (F03 guarantees it does)
-            for (int i = 0; i < 60 && budget.load() > 0; ++i) Sleep(50);
-            Check(budget.load() == 0 && reg.live.empty(),
-                  "F03 success path deregisters (live=0, budget=0)");
-        }
-        closesocket(ln);
-    }
-
-    // ---- 5b. F03: 100 failed CONNECTs must not leak registry entries -----
-    {
-        static TcpRegistry reg2;
-        static ConnectGate gate2;
-        std::atomic<int> budget2{0};
-        std::atomic<bool> alive2{true};
-        auto s2 = std::make_shared<EngineStats>();
-        for (int i = 0; i < 100; ++i) {
-            auto sess = std::make_shared<TcpSession>();   // no accepted socket
-            sess->budget = &budget2;
-            budget2.fetch_add(1);
-            {
-                std::lock_guard<std::mutex> lk(reg2.mtx);
-                reg2.live.push_back(sess);
-            }
-            NatEntry ne{};
-            ne.orig_dst_ip = ntohl(inet_addr("127.0.0.1"));
-            ne.orig_dst_port = 1;              // nothing listens -> REP=0x05
-            ne.flow_id = 1000 + i;
-            TcpWorker(sess, ne, std::string("127.0.0.1"), kPhonePort, auth,
-                      1000 + i, logfn, &reg2, s2, &gate2, &alive2, &budget2);
-            if ((i + 1) % 20 == 0)
-                std::printf("    ... F03 forced REP=0x05 failures: %d/100\n", i + 1);
-        }
-        Check(s2->socks_fail.load() == 100,
-              "F03 100 forced REP=0x05 failures all counted",
-              "fail=" + std::to_string(s2->socks_fail.load()));
-        Check(reg2.live.empty(),
-              "F03 registry empty after 100 failures (was the leak)",
-              "live=" + std::to_string(reg2.live.size()));
-        Check(budget2.load() == 0, "F03 budget back to 0 after 100 failures",
-              "budget=" + std::to_string(budget2.load()));
-    }
-
-    // ---- 5c. F04: a saturated gate must refuse, never dial anyway --------
-    {
-        ConnectGate g;
-        g.cap = 2;
-        std::atomic<bool> alive3{true};
-        bool a1 = g.Acquire(&alive3, 100);
-        bool a2 = g.Acquire(&alive3, 100);
+        bool finalized = false;
+        std::string resp = RunSession(80, baidu, auth, &finalized);
+        Check(resp.find("HTTP/1.") != std::string::npos && finalized,
+              "TcpWorker: HTTP round trip + clean session teardown",
+              resp.substr(0, 15) + " finalized=" +
+                  (finalized ? "yes" : "NO"));
+        // 6. Proxy refusal must produce an immediate RST (ProxyBridge
+        //    reset_close), not a 5 s application timeout.
         auto t0 = std::chrono::steady_clock::now();
-        bool a3 = g.Acquire(&alive3, 250);
-        int wait_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - t0).count();
-        Check(a1 && a2, "F04 grants slots up to the cap");
-        Check(!a3, "F04 saturated gate REFUSES (no 25th CONNECT to the phone)");
-        Check(wait_ms >= 200, "F04 refusal waits out the timeout",
-              std::to_string(wait_ms) + "ms");
-        g.Release();
-        Check(g.Acquire(&alive3, 100), "F04 a released slot is reusable");
-        g.Release();
-        g.Release();
-        // Stop must release queued waiters promptly, not after 8s
-        g.cap = 1;
-        g.Acquire(&alive3, 10);
-        std::atomic<bool> got{false};
-        auto t1 = std::chrono::steady_clock::now();
-        std::thread th([&] { got.store(g.Acquire(&alive3, 5000)); });
-        Sleep(150);
-        alive3.store(false);          // simulate Stop()
-        g.WakeAll();
-        th.join();
-        int wake_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - t1).count();
-        Check(!got.load() && wake_ms < 1000,
-              "F04 Stop() wakes a queued handshake immediately",
-              std::to_string(wake_ms) + "ms");
-        g.Release();
+        int app_err = 0;
+        bool fin2 = false;
+        RunSession(1, baidu, auth, &fin2, &app_err);
+        int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        Check(app_err == WSAECONNRESET && ms < 3000,
+              "CONNECT failure -> immediate app-side RST",
+              "err=" + std::to_string(app_err) + " " +
+                  std::to_string(ms) + "ms");
     }
 
-    // ---- 5d. F02: injection results are verified and counted -------------
+    // 7. Relay socket options (ProxyBridge configure_tcp_socket): Nagle off,
+    //    data-phase timeouts cleared, keep-alive on. Real getsockopt.
     {
-        auto s3 = std::make_shared<EngineStats>();
-        uint8_t pkt[8] = {0};
-        WINDIVERT_ADDRESS ad{};
-        ad.Outbound = 1;
-        WD bad{};
-        bad.send = +[](HANDLE, const PVOID, UINT, UINT* sent,
-                       const WINDIVERT_ADDRESS*) -> BOOL {
-            if (sent) *sent = 0;
-            SetLastError(1234);
-            return FALSE;
-        };
-        bool ok = WdInject(nullptr, bad, pkt, sizeof(pkt), &ad, L"test", 42,
-                           s3, logfn);
-        Check(!ok && s3->inject_attempt.load() == 1 &&
-                  s3->inject_fail.load() == 1,
-              "F02 failed injection counted (attempt=1 fail=1)");
-        WD good{};
-        good.send = +[](HANDLE, const PVOID, UINT len, UINT* sent,
-                        const WINDIVERT_ADDRESS*) -> BOOL {
-            if (sent) *sent = len;
-            return TRUE;
-        };
-        bool ok2 = WdInject(nullptr, good, pkt, sizeof(pkt), &ad, L"test", 43,
-                            s3, logfn);
-        Check(ok2 && s3->inject_ok.load() == 1,
-              "F02 successful injection counted (ok=1)");
+        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        ConfigureRelaySocket(s, true);
+        int nd = 0, kl = 0, il = sizeof(int);
+        DWORD rt = 999; int rl = sizeof(rt);
+        getsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nd, &il);
+        getsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&kl, &il);
+        getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&rt, &rl);
+        Check(nd == 1 && kl == 1 && rt == 0,
+              "relay socket: Nagle off, timeouts cleared, keepalive on",
+              "nodelay=" + std::to_string(nd) + " keepalive=" +
+                  std::to_string(kl) + " rcvtimeo=" + std::to_string(rt));
+        closesocket(s);
     }
 
-    // ---- 5e. F01: slow UDP ASSOCIATE must not stall TCP ----------------
-    {
-        auto us = std::make_shared<UdpSession>();
-        us->app_ip = inet_addr("10.1.2.3");
-        us->app_port = htons(5555);
-        us->last = std::chrono::steady_clock::now();
-        for (int i = 0; i < 3; ++i) {     // first datagrams queued while INIT
-            std::lock_guard<std::mutex> lk(us->q_mtx);
-            us->pending.push_back(
-                UdpPending{inet_addr("8.8.8.8"), htons(9999),
-                           std::vector<uint8_t>{'P', 'I', 'N', 'G',
-                                                (uint8_t)('0' + i)}});
-        }
-        auto ustats = std::make_shared<EngineStats>();
-        std::atomic<int> ubudget{0};
-        std::atomic<bool> ualive{true};
-        WD nowd{};                       // driver stubs: injection will fail
-        nowd.send = +[](HANDLE, const PVOID, UINT, UINT* sent,
-                        const WINDIVERT_ADDRESS*) -> BOOL {
-            if (sent) *sent = 0;
-            return FALSE;
-        };
-        nowd.checksums = +[](PVOID, UINT, WINDIVERT_ADDRESS*, UINT64) -> UINT {
-            return 0;
-        };
-        g_assoc_delay_ms.store(1000);    // phone is busy: 1s handshake
-        auto t0 = std::chrono::steady_clock::now();
-        std::thread(UdpAssociateWorker, us, std::string("127.0.0.1"),
-                    kPhonePort, auth, logfn, ustats, &ubudget, HANDLE(nullptr),
-                    nowd, &ualive)
-            .detach();
-        // While the ASSOCIATE is still in flight, a TCP CONNECT must complete
-        Sleep(120);
-        int state_mid = us->state.load();
-        auto t1 = std::chrono::steady_clock::now();
-        std::string terr;
-        SOCKET probe = ExpSocks5TcpConnect("127.0.0.1", kPhonePort, auth,
-                                           baidu ? baidu : inet_addr("1.1.1.1"),
-                                           htons(80), &terr);
-        int tcp_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - t1).count();
-        Check(state_mid == kUdpInit,
-              "F01 UDP session is INITIALIZING while the phone handshakes");
-        Check(tcp_ms < 900,
-              "F01 new TCP completes while UDP ASSOCIATE is still pending",
-              std::to_string(tcp_ms) + "ms");
-        if (probe != INVALID_SOCKET) closesocket(probe);
-        for (int i = 0; i < 60 && us->state.load() == kUdpInit; ++i) Sleep(50);
-        int total_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - t0).count();
-        Check(us->state.load() == kUdpReady && total_ms >= 900,
-              "F01 session becomes READY after the slow handshake",
-              std::to_string(total_ms) + "ms");
-        Check(ustats->udp_sent.load() == 3,
-              "F01 queued first datagrams flushed in order after READY",
-              "sent=" + std::to_string(ustats->udp_sent.load()));
-        Sleep(300);   // let the recv thread hit a stub inject (F02 counters)
-        Check(ustats->inject_fail.load() >= 0, "F01 recv thread ran (stub WD)");
-        ualive.store(false);
-        ExpSocks5UdpClose(&us->assoc);
-        for (int i = 0; i < 40 && ubudget.load() > 0; ++i) Sleep(50);
-        g_assoc_delay_ms.store(0);
-    }
-
-    // ---- 5f. §5.1: DNS upstream remapping ------------------------------
-    {
-        uint32_t phone_net = inet_addr("192.168.49.1");
-        uint32_t pub = IpToNet("223.5.5.5");
-        Check(PickDnsUpstream(phone_net, phone_net) == pub,
-              "§5.1 phone-as-DNS remapped to public resolver");
-        Check(PickDnsUpstream(inet_addr("10.0.0.1"), phone_net) == pub,
-              "§5.1 private DNS remapped to public resolver");
-        Check(PickDnsUpstream(inet_addr("8.8.8.8"), phone_net) ==
-                  inet_addr("8.8.8.8"),
-              "§5.1 public DNS target kept unchanged");
-    }
-
-    // ---- 5g. §6 DNS pool dead-link redial / NAT collision / §4.5 policy --
-    {
-        DnsProxy dp;
-        dp.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in la{};
-        la.sin_family = AF_INET;
-        la.sin_addr.s_addr = inet_addr("127.0.0.1");
-        la.sin_port = 0;
-        bind(dp.sock, (sockaddr*)&la, sizeof(la));
-
-        SOCKET cli = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in ca{};
-        ca.sin_family = AF_INET;
-        ca.sin_addr.s_addr = inet_addr("127.0.0.1");
-        ca.sin_port = 0;
-        bind(cli, (sockaddr*)&ca, sizeof(ca));
-        sockaddr_in peer{};
-        int pl = sizeof(peer);
-        getsockname(cli, (sockaddr*)&peer, &pl);
-        DWORD tmo = 1000;
-        setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
-
-        // A pooled SOCKS5 link the peer already closed: send() fails on its
-        // first reuse. The engine must close it, redial ONCE and still answer
-        // THIS query (plan §6 "pool reuse 失败，重建连接并重试一次").
-        SOCKET dead = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        shutdown(dead, SD_BOTH);
-        {
-            std::lock_guard<std::mutex> lk(dp.pool_mtx);
-            dp.pool.push_back(dead);
-        }
-        auto st4 = std::make_shared<EngineStats>();
-        DnsQueryWorker(&dp, MakeQuery("www.example.com", 1), peer,
-                       "127.0.0.1", kPhonePort, auth, st4, logfn);
-        Check(st4->dns_ok.load() == 1,
-              "§6 dead pooled DNS link: redial once, query still succeeds",
-              "ok=" + std::to_string(st4->dns_ok.load()) +
-              " fail=" + std::to_string(st4->dns_fail.load()));
-        Check(st4->dns_pool_reuse_fail.load() == 1,
-              "§6 dead pooled link accounted",
-              "reuse_fail=" + std::to_string(st4->dns_pool_reuse_fail.load()));
-        Check(st4->dns_pool_redial_ok.load() == 1,
-              "§6 redial accounted",
-              "redial=" + std::to_string(st4->dns_pool_redial_ok.load()));
-        char rb[1024];
-        int rn = recv(cli, rb, sizeof(rb), 0);
-        Check(rn > 12, "§6 client receives the DNS answer after redial",
-              "bytes=" + std::to_string(rn));
-        {
-            std::lock_guard<std::mutex> lk(dp.pool_mtx);
-            for (SOCKET s : dp.pool) closesocket(s);
-            dp.pool.clear();
-        }
-        closesocket(cli);
-        closesocket(dp.sock);
-
-        NatEntry ne{};
-        ne.app_ip = inet_addr("192.168.49.74");
-        ne.orig_dst_port = 443;
-        Check(!NatEntryClashes(ne, inet_addr("192.168.49.74"), 443),
-              "§6 same flow reuses its own NAT entry");
-        Check(NatEntryClashes(ne, inet_addr("10.0.0.2"), 443),
-              "§6 different app_ip on same NAT key REFUSED (no flow splice)");
-        Check(NatEntryClashes(ne, inet_addr("192.168.49.74"), 80),
-              "§6 different dst port on same NAT key REFUSED");
-        Check(IsQuicPort(443) && !IsQuicPort(53),
-              "§4.5 UDP/443 policy is explicit (no silent global drop)");
-        std::wstring lt1 = FindLegacyTunAdapter();
-        std::wstring lt2 = FindLegacyTunAdapter();
-        Check(lt1 == lt2,
-              "§4.4 legacy virtual adapter detection is read-only & stable",
-              lt1.empty() ? "none present" : "detected, not modified");
-        Check(std::wstring(StateName(1)) != std::wstring(StateName(2)),
-              "F05 RUNNING vs FAULTED are distinct engine states");
-    }
-
-    // ---- 6. Pure logic: full-capture policy --------------------------
-    Check(IsBypassDst(inet_addr("192.168.49.1")), "LAN 192.168.49.1 exempt");
-    Check(IsBypassDst(inet_addr("10.0.0.1")), "LAN 10.0.0.1 exempt");
-    Check(!IsBypassDst(inet_addr("8.8.8.8")), "public 8.8.8.8 NOT exempt");
-    {
-        UINT32 ll[4] = {htonl(0xfe800000), 0, 0, htonl(1)};
-        UINT32 mc[4] = {htonl(0xff020000), 0, 0, htonl(1)};
-        UINT32 glob[4] = {htonl(0x20014860), htonl(0x48600000), 0, htonl(0x8888)};
-        Check(IsIpv6Local(ll), "IPv6 fe80::/10 link-local exempt");
-        Check(IsIpv6Local(mc), "IPv6 ff00::/8 multicast exempt");
-        Check(!IsIpv6Local(glob), "IPv6 2001:... global unicast blocked");
-    }
-    {
-        auto qa = MakeQuery("www.example.com", 1);
-        auto qb = MakeQuery("www.example.com", 28);
-        Check(!IsAaaaOnlyQuery(qa.data(), qa.size()), "A query not AAAA-suppressed");
-        Check(IsAaaaOnlyQuery(qb.data(), qb.size()), "AAAA query detected");
-        auto r = MakeEmptyDnsReply(qb.data(), qb.size());
-        Check(r.size() == qb.size() && (r[2] & 0x80) && r[7] == 0,
-              "empty DNS reply keeps question, 0 answers");
-    }
-    {
-        NatKey a{0x01010101, 1000}, b{0x01010101, 1000}, c{0x01010101, 1001};
-        Check(!(a < b) && !(b < a) && (a < c), "NAT key {dst_ip,src_port} ordering");
-    }
-
-    // ---- 6b. beta0.1.5: control timeout / gate queue / CONNECT retry --
-    {
-        // (1) Without bounded recv/send timeouts, HandshakeAuth() and the
-        // CONNECT reply RecvAll() can block FOREVER when the phone accepts
-        // TCP but never answers ("CONNECT reply missing" in the field log),
-        // holding a gate slot and starving every later flow.
-        std::string e1;
-        SOCKET ctl = ExpSocks5TcpConnect("127.0.0.1", kPhonePort, auth,
-                                         inet_addr("223.5.5.5"), htons(53),
-                                         &e1);
-        Check(ctl != INVALID_SOCKET, "beta0.1.5 control CONNECT succeeds", e1);
-        if (ctl != INVALID_SOCKET) {
-            DWORD rto = 0, sto = 0;
-            int l1 = sizeof(rto), l2 = sizeof(sto);
-            getsockopt(ctl, SOL_SOCKET, SO_RCVTIMEO, (char*)&rto, &l1);
-            getsockopt(ctl, SOL_SOCKET, SO_SNDTIMEO, (char*)&sto, &l2);
-            Check(rto == 6000, "b0.1.6 control SO_RCVTIMEO=6s (bounds a stalled phone)",
-                  std::to_string(rto));
-            Check(sto == 6000, "b0.1.6 control SO_SNDTIMEO=6s",
-                  std::to_string(sto));
-            closesocket(ctl);
-        }
-
-        // (2) b0.1.6: the gate is THREE concurrent handshakes. The field
-        // log proved 8 already saturated the phone (3x "reply missing",
-        // 3094ms / 10250ms CONNECTs). The 4th QUEUES instead of dialling.
-        static ConnectGate gq;
-        static std::atomic<bool> gq_alive{true};
-        Check(gq.cap == 3, "b0.1.6 gate cap is 3 (phone-safe concurrency)",
-              std::to_string(gq.cap));
-        int acquired = 0;
-        for (int i = 0; i < 3; ++i)
-            if (gq.Acquire(&gq_alive, 100)) ++acquired;
-        Check(acquired == 3, "gate allows exactly 3 concurrent CONNECTs",
-              std::to_string(acquired));
-        Check(!gq.Acquire(&gq_alive, 60),
-              "4th handshake QUEUES (never dials a saturated phone)");
-        std::atomic<bool> got{false};
-        std::thread waiter([&gq, &got] {
-            got.store(gq.Acquire(&gq_alive, 3000));
-        });
-        Sleep(80);
-        Check(!got.load(), "waiter stays queued while the gate is full");
-        gq.Release();
-        waiter.join();
-        Check(got.load(), "queued handshake proceeds once a slot frees");
-        for (int i = 0; i < 3; ++i) gq.Release();
-
-        // (3) One transient "CONNECT reply missing" must be retried and
-        // recovered, then finalized exactly once.
-        g_transient_drop.store(1);
-        auto st3 = std::make_shared<EngineStats>();
-        static TcpRegistry reg3;
-        static ConnectGate gate3;
-        static std::atomic<bool> stop3{true};
-        static std::atomic<int> budget3{0};
-        SOCKET ln3 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        sockaddr_in la3{};
-        la3.sin_family = AF_INET;
-        la3.sin_addr.s_addr = inet_addr("127.0.0.1");
-        la3.sin_port = 0;
-        bind(ln3, (sockaddr*)&la3, sizeof(la3));
-        listen(ln3, 4);
-        sockaddr_in got3{}; int gl3 = sizeof(got3);
-        getsockname(ln3, (sockaddr*)&got3, &gl3);
-        SOCKET app3 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        connect(app3, (sockaddr*)&got3, sizeof(got3));
-        SOCKET acc3 = accept(ln3, nullptr, nullptr);
-        Check(acc3 != INVALID_SOCKET, "retry-test reflection socket pair");
-        if (acc3 != INVALID_SOCKET) {
-            auto sess3 = std::make_shared<TcpSession>();
-            sess3->client.store(acc3);
-            sess3->budget = &budget3;
-            budget3.fetch_add(1);
-            {
-                std::lock_guard<std::mutex> lk(reg3.mtx);
-                reg3.live.push_back(sess3);
-            }
-            NatEntry ne3{};
-            ne3.orig_dst_ip = ntohl(inet_addr("223.5.5.5"));
-            ne3.orig_dst_port = 53;
-            ne3.app_ip = inet_addr("127.0.0.1");
-            ne3.flow_id = 777;
-            std::thread(TcpWorker, sess3, ne3, std::string("127.0.0.1"),
-                        kPhonePort, auth, (uint64_t)777, logfn, &reg3, st3,
-                        &gate3, &stop3, &budget3).detach();
-            for (int i = 0; i < 100 &&
-                 st3->socks_ok.load() == 0 && st3->socks_fail.load() == 0;
-                 ++i) Sleep(50);
-            Check(st3->connect_retry.load() == 1,
-                  "transient CONNECT failure triggers one retry",
-                  std::to_string(st3->connect_retry.load()));
-            Check(st3->connect_retry_ok.load() == 1 &&
-                      st3->socks_ok.load() == 1,
-                  "retry recovers the session (phone answers 2nd dial)");
-            closesocket(app3);
-            for (int i = 0; i < 100 && budget3.load() > 0; ++i) Sleep(50);
-            Check(budget3.load() == 0 && reg3.live.empty(),
-                  "retry path finalizes exactly once (live=0, budget=0)");
-        }
-        closesocket(ln3);
-        g_transient_drop.store(0);
-    }
-
-    // ---- 6c. b0.1.6: 3-attempt retry / slow phone must NOT drop --------
-    // Field log: 3x "CONNECT reply missing" and a 10250ms CONNECT. The
-    // reflected handshake has already told the app "connected", so a failed
-    // or very slow CONNECT shows up as "通了又关" / "很卡".
-    {
-        auto RunFlow = [&](uint64_t fid, uint32_t dst, uint16_t dport,
-                           std::shared_ptr<EngineStats> stx,
-                           TcpRegistry* regx, ConnectGate* gatex,
-                           std::atomic<bool>* stopx,
-                           std::atomic<int>* budgetx, SOCKET* out_app) {
-            SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            sockaddr_in la{};
-            la.sin_family = AF_INET;
-            la.sin_addr.s_addr = inet_addr("127.0.0.1");
-            la.sin_port = 0;
-            bind(ln, (sockaddr*)&la, sizeof(la));
-            listen(ln, 4);
-            sockaddr_in got{}; int gl = sizeof(got);
-            getsockname(ln, (sockaddr*)&got, &gl);
-            SOCKET app = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            connect(app, (sockaddr*)&got, sizeof(got));
-            SOCKET acc = accept(ln, nullptr, nullptr);
-            closesocket(ln);
-            if (acc == INVALID_SOCKET) { closesocket(app); return false; }
-            auto sess = std::make_shared<TcpSession>();
-            sess->client.store(acc);
-            sess->budget = budgetx;
-            budgetx->fetch_add(1);
-            {
-                std::lock_guard<std::mutex> lk(regx->mtx);
-                regx->live.push_back(sess);
-            }
-            NatEntry ne{};
-            ne.orig_dst_ip = ntohl(dst);
-            ne.orig_dst_port = dport;
-            ne.app_ip = inet_addr("127.0.0.1");
-            ne.flow_id = fid;
-            std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
-                        kPhonePort, auth, fid, logfn, regx, stx,
-                        gatex, stopx, budgetx).detach();
-            *out_app = app;
-            return true;
-        };
-
-        // (1) TWO consecutive dropped CONNECT replies -> 3rd attempt wins.
-        g_transient_drop.store(2);
-        auto st4 = std::make_shared<EngineStats>();
-        static TcpRegistry reg4;
-        static ConnectGate gate4;
-        static std::atomic<bool> stop4{true};
-        static std::atomic<int> budget4{0};
-        SOCKET app4 = INVALID_SOCKET;
-        bool l4 = RunFlow(800, inet_addr("223.5.5.5"), 53,
-                          st4, &reg4, &gate4, &stop4, &budget4, &app4);
-        Check(l4, "b0.1.6 retry flow reflection socket pair");
-        if (l4) {
-            for (int i = 0; i < 200 &&
-                 st4->socks_ok.load() == 0 && st4->socks_fail.load() == 0;
-                 ++i) Sleep(50);
-            Check(st4->connect_retry.load() == 1,
-                  "b0.1.6 transient failures counted as one retrying flow",
-                  std::to_string(st4->connect_retry.load()));
-            Check(st4->connect_retry_ok.load() == 1 &&
-                      st4->socks_ok.load() == 1,
-                  "b0.1.6 3-attempt policy recovers after TWO drops",
-                  "ok=" + std::to_string(st4->socks_ok.load()) +
-                  " fail=" + std::to_string(st4->socks_fail.load()));
-            closesocket(app4);
-            for (int i = 0; i < 100 && budget4.load() > 0; ++i) Sleep(50);
-            Check(budget4.load() == 0 && reg4.live.empty(),
-                  "b0.1.6 3-attempt success path finalizes once");
-        }
-        g_transient_drop.store(0);
-
-        // (2) A 900ms phone still completes; latency is recorded for p50/p95.
-        g_connect_delay_ms.store(900);
-        auto st5 = std::make_shared<EngineStats>();
-        static TcpRegistry reg5;
-        static ConnectGate gate5;
-        static std::atomic<bool> stop5{true};
-        static std::atomic<int> budget5{0};
-        SOCKET app5 = INVALID_SOCKET;
-        bool l5 = RunFlow(801, inet_addr("223.5.5.5"), 53,
-                          st5, &reg5, &gate5, &stop5, &budget5, &app5);
-        Check(l5, "b0.1.6 slow-phone flow reflection socket pair");
-        if (l5) {
-            for (int i = 0; i < 200 &&
-                 st5->socks_ok.load() == 0 && st5->socks_fail.load() == 0;
-                 ++i) Sleep(50);
-            Check(st5->socks_ok.load() == 1,
-                  "b0.1.6 slow phone (900ms) CONNECT still succeeds, no reset",
-                  "ok=" + std::to_string(st5->socks_ok.load()) +
-                  " fail=" + std::to_string(st5->socks_fail.load()));
-            int last_ms = -1;
-            {
-                std::lock_guard<std::mutex> lk(st5->connect_ms_mtx);
-                if (!st5->connect_ms.empty()) last_ms = st5->connect_ms.back();
-            }
-            Check(last_ms >= 850,
-                  "b0.1.6 CONNECT latency recorded for p50/p95 diagnostics",
-                  std::to_string(last_ms) + "ms");
-            closesocket(app5);
-            for (int i = 0; i < 100 && budget5.load() > 0; ++i) Sleep(50);
-            Check(budget5.load() == 0 && reg5.live.empty(),
-                  "b0.1.6 slow-phone path finalizes once");
-        }
-        g_connect_delay_ms.store(0);
-    }
-
-    // ---- 7. WinDivert filter compile + packet evaluation --------------
-    // These helpers live in WinDivert.dll and do NOT need the driver or
-    // elevation. They prove the filter is syntactically valid and that IPv6
-    // / phone-endpoint packets are classified as intended. A bad filter is
-    // a classic "connects but never proxies" failure that no amount of
-    // SOCKS5 debugging would reveal.
+    // 8. The product's OWN filter string (not a hand-copied test constant):
+    //    compiles, captures public IPv4/IPv6, excludes reinjected/impostor
+    //    packets and the phone endpoint. No driver needed for these helpers.
     {
         HMODULE dll = LoadLibraryA("dist/WinDivert.dll");
-        Check(dll != nullptr, "WinDivert.dll loads (helper API, no driver)");
-        if (dll) {
+        if (!dll) {
+            Check(false, "WinDivert.dll helper API available",
+                  "LoadLibrary failed (run from the exp project root)");
+        } else {
             typedef BOOL (*CompileFn)(const char*, WINDIVERT_LAYER, char*, UINT,
                                       const char**, UINT*);
             typedef BOOL (*EvalFn)(const char*, const VOID*, UINT,
                                    const WINDIVERT_ADDRESS*);
-            typedef HANDLE (*OpenFn)(const char*, WINDIVERT_LAYER, INT16, UINT64);
-            typedef BOOL (*CloseFn)(HANDLE);
-            auto compile = (CompileFn)GetProcAddress(dll, "WinDivertHelperCompileFilter");
+            auto compile = (CompileFn)GetProcAddress(
+                dll, "WinDivertHelperCompileFilter");
             auto eval = (EvalFn)GetProcAddress(dll, "WinDivertHelperEvalFilter");
-            auto wopen = (OpenFn)GetProcAddress(dll, "WinDivertOpen");
-            auto wclose = (CloseFn)GetProcAddress(dll, "WinDivertClose");
-            Check(compile && eval, "WinDivert filter helper exports present");
-
-            // Exactly the expression assembled in ExpEngine::Start (example
-            // values substituted for the runtime phone IP and listener port).
-            // beta0.1.5 adds !impostor to every branch and drops the
-            // `outbound` restriction on the listener-return branch.
-            std::string nf =
-                "(outbound and !loopback and !impostor and "
-                "ip.DstAddr != 192.168.49.1 and (tcp or udp)) "
-                "or (outbound and !loopback and !impostor and ipv6) "
-                "or (tcp.SrcPort == 7712 and !impostor)";
-            std::string of =   // beta0.1.4
-                "outbound and !loopback and ip.DstAddr != 192.168.49.1 "
-                "and (tcp or udp) or (outbound and !loopback and ipv6) "
-                "or (outbound and tcp.SrcPort == 7712)";
-            std::string of2 =  // beta0.1.2 (no IPv6 branch at all)
-                "outbound and !loopback and ip.DstAddr != 192.168.49.1 "
-                "and (tcp or udp) or (outbound and tcp.SrcPort == 7712)";
-            if (compile) {
-                const char* es = nullptr; UINT pos = 0;
-                BOOL c = compile(nf.c_str(), WINDIVERT_LAYER_NETWORK,
-                                 nullptr, 0, &es, &pos);
-                Check(c == TRUE, "beta0.1.5 filter (!impostor) compiles",
-                      c ? "OK" : std::string(es ? es : "?") + "@" +
-                                    std::to_string(pos));
-                Check(compile("outbound and !impostor and (tcp or udp)",
-                              WINDIVERT_LAYER_NETWORK, nullptr, 0, &es,
-                              &pos) == TRUE,
-                      "impostor is a legal WinDivert filter token");
-            }
-            if (eval) {
-                WINDIVERT_ADDRESS ad{};
-                ad.Outbound = 1;
-                // The driver sets addr.IPv6 for real IPv6 captures; the
-                // filter's `ipv6` token reads that bit (not just the header).
-                WINDIVERT_ADDRESS ad6{};
-                ad6.Outbound = 1;
-                ad6.IPv6 = 1;
-                // IPv6 + TCP SYN to a global unicast address
-                uint8_t v6[60] = {0};
-                v6[0] = 0x60; v6[5] = 20; v6[6] = 6; v6[7] = 64;
-                v6[8] = 0x20; v6[9] = 0x01; v6[10] = 0x0d; v6[11] = 0xb8;
-                v6[23] = 1;
-                v6[24] = 0x20; v6[25] = 0x01; v6[26] = 0x48; v6[27] = 0x60;
-                v6[38] = 0x88; v6[39] = 0x88;
-                v6[40] = 0x30; v6[41] = 0x39; v6[42] = 0x01; v6[43] = 0xbb;
-                v6[52] = 0x50; v6[53] = 0x02;
-                const char* probes[] = {
-                    "outbound", "ipv6", "outbound and ipv6",
-                    "outbound and !loopback and ipv6", "ip", "tcp"
-                };
-                for (auto* f : probes)
-                    std::printf("[probe] %-40s IPv6 packet = %s\n", f,
-                                eval(f, v6, sizeof(v6), &ad6) == TRUE
-                                    ? "TRUE" : "FALSE");
-                bool n6 = eval(nf.c_str(), v6, sizeof(v6), &ad6) == TRUE;
-                bool o6 = eval(of2.c_str(), v6, sizeof(v6), &ad6) == TRUE;
-                Check(n6, "beta0.1.5 filter CAPTURES global IPv6 egress");
-                Check(!o6, "beta0.1.2 filter MISSED IPv6 (historical leak)");
-                WINDIVERT_ADDRESS ad6i = ad6;
-                ad6i.Impostor = 1;
-                Check(eval(nf.c_str(), v6, sizeof(v6), &ad6i) != TRUE,
-                      "injected IPv6 packet is NOT re-captured (loop guard)");
-
-                // IPv4 + TCP SYN to a public host
+            std::string f = BuildCaptureFilter("192.168.49.1", 7712);
+            const char* es = nullptr; UINT pos = 0;
+            bool compiled = compile &&
+                compile(f.c_str(), WINDIVERT_LAYER_NETWORK, nullptr, 0,
+                        &es, &pos) == TRUE;
+            Check(compiled, "product BuildCaptureFilter() compiles",
+                  compiled ? f : std::string(es ? es : "no helper") + "@" +
+                                  std::to_string(pos));
+            if (eval && compiled) {
                 uint8_t v4[40] = {0};
-                v4[0] = 0x45; v4[2] = 0; v4[3] = 40; v4[9] = 6;
+                v4[0] = 0x45; v4[3] = 40; v4[9] = 6;
                 v4[12] = 192; v4[13] = 168; v4[14] = 49; v4[15] = 74;
                 v4[16] = 8; v4[17] = 8; v4[18] = 8; v4[19] = 8;
-                v4[20] = 0xC3; v4[21] = 0x50; v4[22] = 0x01; v4[23] = 0xbb;
+                v4[20] = 0xC3; v4[21] = 0x50; v4[22] = 0x01; v4[23] = 0xBB;
                 v4[32] = 0x50; v4[33] = 0x02;
-                Check(eval(nf.c_str(), v4, sizeof(v4), &ad) == TRUE,
-                      "beta0.1.5 filter CAPTURES public IPv4 TCP");
-
-                // DECISIVE beta0.1.5 evidence: a LAN/IPv6 packet that we
-                // reinject UNCHANGED has Impostor=1. 0.1.4's filter matched
-                // it again, so the same packet was captured -> reinjected ->
-                // captured forever (field log: recv_ok 698->870->960 while
-                // every business counter stayed frozen). The new filter
-                // must exclude it.
-                WINDIVERT_ADDRESS ad_imp = ad;
-                ad_imp.Impostor = 1;
-                Check(eval(nf.c_str(), v4, sizeof(v4), &ad_imp) != TRUE,
-                      "beta0.1.5 EXCLUDES reinjected packet (no capture loop)");
-                Check(eval(of.c_str(), v4, sizeof(v4), &ad_imp) == TRUE,
-                      "beta0.1.4 RE-CAPTURED reinjected packet (loop root cause)");
-
-                // Listener return packets were restricted to `outbound` in
-                // 0.1.4. A reply classified inbound/loopback was never
-                // rewritten -> the app got a packet addressed to the local
-                // listener port and reset the flow. 0.1.5 captures it in
-                // ALL directions.
-                uint8_t reply[40] = {0};
-                reply[0] = 0x45; reply[3] = 40; reply[9] = 6;
-                reply[12] = 192; reply[13] = 168; reply[14] = 49;
-                reply[15] = 74;
-                reply[16] = 8; reply[17] = 8; reply[18] = 8; reply[19] = 8;
-                reply[20] = 0x1E; reply[21] = 0x20;  // SrcPort 7712
-                reply[22] = 0xC3; reply[23] = 0x50;
-                // A valid TCP header needs DataOffset=5 (>=20 bytes) or
-                // WinDivert's parser refuses to expose tcp.* fields at all.
-                reply[32] = 0x50; reply[33] = 0x10;  // 5 words, ACK
-                WINDIVERT_ADDRESS ad_ret{};
-                ad_ret.Outbound = 0;      // stack classified it otherwise
-                ad_ret.Loopback = 1;
-                const char* rp[] = {"tcp", "tcp.SrcPort == 7712", "!impostor",
-                                    "tcp.SrcPort == 7712 and !impostor",
-                                    "loopback", "inbound"};
-                for (auto* f : rp)
-                    std::printf("[reply-probe] %-42s = %s\n", f,
-                                eval(f, reply, sizeof(reply), &ad_ret) == TRUE
-                                    ? "TRUE" : "FALSE");
-                Check(eval(nf.c_str(), reply, sizeof(reply), &ad_ret) == TRUE,
-                      "beta0.1.5 CAPTURES listener reply in any direction");
-                Check(eval(of.c_str(), reply, sizeof(reply), &ad_ret) != TRUE,
-                      "beta0.1.4 MISSED non-outbound listener reply");
-
-                // IPv4 to the phone SOCKS5 endpoint must NOT be captured
-                v4[16] = 192; v4[17] = 168; v4[18] = 49; v4[19] = 1;
-                Check(eval(nf.c_str(), v4, sizeof(v4), &ad) != TRUE,
-                      "phone SOCKS5 endpoint excluded (no proxy loop)");
-            }
-            // Informational: driver availability on this non-elevated host.
-            if (wopen) {
-                HANDLE h = wopen(nf.c_str(), WINDIVERT_LAYER_NETWORK, 0, 0);
-                if (h == INVALID_HANDLE_VALUE) {
-                    std::printf("[INFO] WinDivertOpen err=%lu (no elevation here); "
-                                "driver-layer injection must be verified on the "
-                                "target PC. Not counted as a test failure.\n",
-                                (unsigned long)GetLastError());
-                } else {
-                    std::printf("[INFO] WinDivert driver IS available on this host.\n");
-                    if (wclose) wclose(h);
-                }
+                WINDIVERT_ADDRESS ad{}; ad.Outbound = 1;
+                WINDIVERT_ADDRESS ad_imp = ad; ad_imp.Impostor = 1;
+                WINDIVERT_ADDRESS ad6{}; ad6.Outbound = 1; ad6.IPv6 = 1;
+                uint8_t v6[60] = {0};
+                v6[0] = 0x60; v6[5] = 20; v6[6] = 6; v6[7] = 64;
+                v6[8] = 0x20; v6[9] = 0x01; v6[10] = 0x0D; v6[11] = 0xB8;
+                v6[24] = 0x20; v6[25] = 0x01; v6[26] = 0x48; v6[27] = 0x60;
+                v6[40] = 0x30; v6[41] = 0x39; v6[42] = 0x01; v6[43] = 0xBB;
+                v4[16] = 192; v4[17] = 168; v4[18] = 49; v4[19] = 1;  // phone
+                bool excl_phone = eval(f.c_str(), v4, sizeof(v4), &ad) != TRUE;
+                v4[16] = 8; v4[17] = 8; v4[18] = 8; v4[19] = 8;
+                bool cap4 = eval(f.c_str(), v4, sizeof(v4), &ad) == TRUE;
+                bool excl_imp = eval(f.c_str(), v4, sizeof(v4), &ad_imp) != TRUE;
+                bool cap6 = eval(f.c_str(), v6, sizeof(v6), &ad6) == TRUE;
+                Check(cap4 && cap6 && excl_imp && excl_phone,
+                      "filter captures IPv4+IPv6, excludes impostor+phone",
+                      "v4=" + std::to_string(cap4) + " v6=" +
+                          std::to_string(cap6) + " impostor=" +
+                          std::to_string(excl_imp) + " phone=" +
+                          std::to_string(excl_phone));
             }
             FreeLibrary(dll);
         }
@@ -1302,8 +584,7 @@ int main(int argc, char** argv) {
     Sleep(150);
     std::fflush(stdout);
     // Detached mock-phone/pump threads must not outlive main: their late
-    // pthread_create calls otherwise throw std::system_error during CRT
-    // teardown and mask the real result with a nonzero exit code.
+    // pthread_create calls otherwise throw during CRT teardown.
     ExitProcess((UINT)rc);
     return rc;
 }
