@@ -240,6 +240,14 @@ struct TcpSession {
     std::atomic<bool> finalized{false};
     std::atomic<uint64_t> up{0};     // app -> phone bytes
     std::atomic<uint64_t> down{0};   // phone -> app bytes
+    // Which side closed first. -1 = still open, 0 = app, 1 = phone.
+    // The field log has many "↑0B ↓0B 0s" sessions; without this the reason
+    // for an immediate close is invisible.
+    std::atomic<int> first_eof{-1};
+    void NoteEof(int who) {
+        int expected = -1;
+        first_eof.compare_exchange_strong(expected, who);
+    }
 
     // Single owner of the close. beta0.1.3's CONNECT-failure branch closed
     // the accepted socket and returned WITHOUT deregistering, so the session
@@ -299,6 +307,8 @@ void Pump(TcpSession* s, int from) {
         } else {
             int e = WSAGetLastError();
             if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) continue;
+            // from==0 reads the app socket, from==1 reads the phone socket
+            s->NoteEof(from == 0 ? 0 : 1);
             if (n == 0) shutdown(dst, SD_SEND);  // clean EOF: half-close only
             break;
         }
@@ -320,13 +330,15 @@ struct ConnectGate {
     std::mutex m;
     std::condition_variable cv;
     int cur = 0;
-    // beta0.1.5: the field log showed 28 CONNECTs opened within ~2s and the
-    // phone's ProxyServer stopped answering four of them ("CONNECT reply
-    // missing") while the reflected handshake had already told the app it
-    // was connected. 24 concurrent handshakes is far beyond what a Kotlin
-    // phone-side thread pool sustains. Serialise to 8 and QUEUE the rest
-    // (20s) instead of cancelling them — slow is better than a dead socket.
-    int cap = 8;
+    // beta0.1.6 field log: even 8 concurrent handshakes saturated the
+    // phone's Kotlin ProxyServer — three "CONNECT reply missing" and
+    // individual CONNECTs of 3094ms / 10250ms, while the reflected
+    // handshake had ALREADY told the app "connected". The app then timed
+    // out waiting for TLS data and reset the flow ("通了又关"/"很卡").
+    // At low concurrency the same phone answers in 40-90ms, so serialising
+    // to 3 is FASTER end-to-end than letting it thrash. Everything else
+    // QUEUES (30s), never cancels — slow beats a dead socket.
+    int cap = 3;
 
     bool Acquire(std::atomic<bool>* stop, int timeout_ms) {
         std::unique_lock<std::mutex> lk(m);
@@ -394,6 +406,17 @@ struct EngineStats {
     std::atomic<uint64_t> udp_assoc_fail{0};
     std::atomic<uint64_t> udp_sent{0};
     std::atomic<uint64_t> udp_reply{0};
+    // beta0.1.6: a single malformed relay datagram used to kill the whole
+    // receive thread. These make the "UDP silently dies" symptom observable.
+    std::atomic<uint64_t> udp_reply_bad{0};   // skipped datagrams (thread lives)
+    std::atomic<uint64_t> udp_assoc_dead{0};  // control conn died -> rebuilt
+    // TCP handshake latency distribution: proves whether the phone is the
+    // bottleneck (p95 in seconds) or the local reflection path is.
+    std::mutex connect_ms_mtx;
+    std::vector<int> connect_ms;
+    std::atomic<uint64_t> tcp_zero_close{0};  // connected, 0 bytes, closed
+    std::atomic<uint64_t> tcp_eof_remote{0};  // phone side closed first
+    std::atomic<uint64_t> tcp_eof_app{0};     // app side closed first
     // Plan §6: the {dst_ip, src_port} NAT key can collide when two local
     // addresses (or two destination ports) reuse the same source port.
     // Count and REFUSE rather than silently splicing two flows together.
@@ -760,7 +783,7 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     // saturated we cancel instead of adding a 25th handshake to a phone that
     // is already answering REP=0x05 / 3-5s. The wait is cancellable, so
     // Stop()/FAULTED never hangs behind a queued handshake.
-    if (!gate->Acquire(stop, 20000)) {
+    if (!gate->Acquire(stop, 30000)) {
         stats->gate_timeout.fetch_add(1);
         log(L"[exp] #" + std::to_wstring(flow_id) +
             L" 并发闸门超时或引擎停止 → 取消（未向手机发起 CONNECT）→ " +
@@ -775,7 +798,7 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     // server-side verdict, not a transient loss.
     std::string err;
     SOCKET r = INVALID_SOCKET;
-    constexpr int kMaxConnectAttempts = 2;
+    constexpr int kMaxConnectAttempts = 3;
     for (int attempt = 0; attempt < kMaxConnectAttempts; ++attempt) {
         // NOTE: this pointer is &Impl::running (true == engine RUNNING),
         // despite the historical parameter name "stop". A stopped engine
@@ -796,8 +819,8 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
             err.find("timed out") != std::string::npos ||
             err.find("unreachable") != std::string::npos ||
             err.find("send failed") != std::string::npos;
-        if (!transient) break;
-        Sleep(150);
+        if (!transient || attempt + 1 >= kMaxConnectAttempts) break;
+        Sleep(250);
     }
     gate->Release();
     if (r == INVALID_SOCKET) {
@@ -814,6 +837,10 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     int ms = static_cast<int>(std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
         .count());
+    {
+        std::lock_guard<std::mutex> lk(stats->connect_ms_mtx);
+        if (stats->connect_ms.size() < 512) stats->connect_ms.push_back(ms);
+    }
     log(L"[exp] #" + std::to_wstring(flow_id) + L" 手机已接通 → " + dstw +
         L" (" + std::to_wstring(ms) + L"ms)");
     std::thread t1(Pump, s.get(), 0);
@@ -822,9 +849,24 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     t2.join();
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - t0).count();
+    uint64_t up = s->up.load(), down = s->down.load();
+    int eof = s->first_eof.load();
+    std::wstring why;
+    if (up == 0 && down == 0) {
+        stats->tcp_zero_close.fetch_add(1);
+        why = L"零字节·应用或手机立即关闭";
+    } else if (eof == 1) {
+        stats->tcp_eof_remote.fetch_add(1);
+        why = L"手机侧先关闭";
+    } else if (eof == 0) {
+        stats->tcp_eof_app.fetch_add(1);
+        why = L"应用侧先关闭";
+    } else {
+        why = L"双向硬关闭";
+    }
     log(L"[exp] #" + std::to_wstring(flow_id) + L" 结束 " + dstw +
-        L" ↑" + HUMAN_BYTES(s->up.load()) + L" ↓" +
-        HUMAN_BYTES(s->down.load()) + L" " + std::to_wstring(secs) + L"s");
+        L" ↑" + HUMAN_BYTES(up) + L" ↓" + HUMAN_BYTES(down) + L" " +
+        std::to_wstring(secs) + L"s [" + why + L"]");
     SessionFinalize(s, reg, stats, budget);
 }
 
@@ -853,6 +895,11 @@ struct UdpSession {
     uint32_t if_idx = 0;
     uint32_t sub_if_idx = 0;
     std::chrono::steady_clock::time_point last;
+    // Some relays put 0.0.0.0:0 in the reply's DST header. Remember the last
+    // destination we sent to so the injected reply can still carry a source
+    // endpoint the application socket will accept.
+    std::atomic<uint32_t> last_dst_ip{0};
+    std::atomic<uint32_t> last_dst_port{0};
     // first datagrams captured while the handshake is in flight (bounded)
     std::mutex q_mtx;
     std::vector<UdpPending> pending;
@@ -860,26 +907,58 @@ struct UdpSession {
 
 constexpr size_t kUdpPendingMax = 8;
 
+// The single decision that decides whether UDP lives or dies. beta0.1.5
+// treated EVERY n<=0 as fatal, so one fragmented / domain-ATYP / wrong-port
+// reply ended the session's receive thread permanently. Only a genuine
+// socket failure (-1) may end it; everything else skips one datagram.
+enum class UdpRecvDecision { kForward, kSkip, kExit };
+UdpRecvDecision ClassifyUdpRecv(int n) {
+    if (n == -1) return UdpRecvDecision::kExit;
+    if (n <= 0) return UdpRecvDecision::kSkip;
+    return UdpRecvDecision::kForward;
+}
+
 void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
                    std::atomic<int>* udp_budget,
                    std::shared_ptr<EngineStats> stats,
-                   std::function<void(const std::wstring&)> log) {
+                   std::function<void(const std::wstring&)> log,
+                   std::atomic<bool>* alive) {
     uint8_t payload[65535];
     for (;;) {
-        // Exits when the association sockets are closed (Stop / expiry /
-        // control-conn death) — no Impl member is touched after that.
-        DWORD tmo = 1500;
+        // Exits only on a REAL socket error, a dead ASSOCIATE control
+        // connection, or engine shutdown — never on one bad datagram.
+        DWORD tmo = 1000;
         setsockopt(sess->assoc.udp, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+        // RFC 1928: closing the TCP control connection terminates the UDP
+        // association. beta0.1.5 never checked it, so a session silently
+        // became send-only — the field log froze at "回包 8" while "发送 9"
+        // kept growing. Detect it and let the next datagram rebuild.
+        if (!ExpSocks5UdpCtrlAlive(sess->assoc)) {
+            stats->udp_assoc_dead.fetch_add(1);
+            log(L"[exp] UDP ASSOCIATE 控制连接已关闭 → 会话 " +
+                IpW(sess->app_ip) + L":" +
+                std::to_wstring(ntohs(sess->app_port)) +
+                L" 将自动重建（不再静默变成只发不收）");
+            break;
+        }
         uint32_t sip = 0;
         uint16_t sport = 0;
         int n = ExpSocks5UdpRecv(sess->assoc, &sip, &sport, payload,
                                  sizeof(payload));
-        if (n <= 0) {
-            int e = WSAGetLastError();
-            if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) continue;
-            break;  // control conn closed -> association dead
+        UdpRecvDecision d = ClassifyUdpRecv(n);
+        if (d == UdpRecvDecision::kExit) break;  // genuine socket failure
+        if (d == UdpRecvDecision::kSkip) {
+            // -2 short/empty, -3 foreign IP, -4 FRAG, -5 ATYP. Skip ONE
+            // datagram and keep receiving. beta0.1.5 killed the thread here.
+            if (n < -1) stats->udp_reply_bad.fetch_add(1);
+            continue;
         }
+        // A relay may answer with 0.0.0.0:0 in the DST header. Restore the
+        // endpoint we last sent to, otherwise the app drops the reply.
+        if (sip == 0) sip = sess->last_dst_ip.load();
+        if (sport == 0)
+            sport = static_cast<uint16_t>(sess->last_dst_port.load());
         // Rebuild the UDP packet as if it came from the ORIGINAL destination
         // and inject inbound so the app socket accepts it.
         size_t psz = sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + n;
@@ -910,6 +989,15 @@ void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
                      stats, log))
             stats->udp_reply.fetch_add(1);
     }
+    // Hand the session back to MainLoop for a fresh ASSOCIATE. Only while
+    // the engine is alive — during Stop() a rebuild would outlive the driver.
+    if (alive && alive->load()) {
+        sess->state.store(kUdpFailed);
+        sess->retry_at = std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(200);
+        ExpSocks5UdpClose(&sess->assoc);  // sole owner during a rebuild
+    }
+    // During Stop() the engine already owns the close — never close twice.
     udp_budget->fetch_sub(1);
 }
 
@@ -959,12 +1047,14 @@ void UdpAssociateWorker(std::shared_ptr<UdpSession> sess, std::string phone8,
         q.swap(sess->pending);
     }
     udp_budget->fetch_add(1);
-    std::thread(UdpRecvThread, divert, wd, sess, udp_budget, stats, log)
+    std::thread(UdpRecvThread, divert, wd, sess, udp_budget, stats, log, stop)
         .detach();
     int flushed = 0;
     for (auto& p : q) {
         if (ExpSocks5UdpSend(sess->assoc, p.dst_ip, p.dst_port, p.data.data(),
                              static_cast<int>(p.data.size()))) {
+            sess->last_dst_ip.store(p.dst_ip);
+            sess->last_dst_port.store(ntohs(p.dst_port));
             stats->udp_sent.fetch_add(1);
             ++flushed;
         } else {
@@ -1346,6 +1436,19 @@ void ExpEngine::Impl::ExpireLoop() {
         if (ticks % 10 == 0) {
             AuditTcpTakeover();   // independent, OS-table-based proof
             const wchar_t* st = StateName(state.load());
+            // Handshake latency distribution: if p95 is in seconds the
+            // bottleneck is the phone SOCKS5 server, not the local relay.
+            int p50 = 0, p95 = 0, cmax = 0;
+            {
+                std::lock_guard<std::mutex> lk(stats->connect_ms_mtx);
+                std::vector<int> v(stats->connect_ms);
+                if (!v.empty()) {
+                    std::sort(v.begin(), v.end());
+                    p50 = v[v.size() / 2];
+                    p95 = v[(v.size() * 95) / 100];
+                    cmax = v.back();
+                }
+            }
             log(L"[exp] 统计[" + std::wstring(st) + L"]: TCP 活动 " +
                 std::to_wstring(tcp_budget.load()) +
                 L" | 成功 " + std::to_wstring(stats->socks_ok.load()) +
@@ -1364,6 +1467,8 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" 发送 " + std::to_wstring(stats->udp_sent.load()) +
                 L" 回包 " + std::to_wstring(stats->udp_reply.load()) +
                 L" 丢弃 " + std::to_wstring(stats->udp_drop.load()) +
+                L" 异常跳过 " + std::to_wstring(stats->udp_reply_bad.load()) +
+                L" 会话重建 " + std::to_wstring(stats->udp_assoc_dead.load()) +
                 L" | UDP443 代理 " + std::to_wstring(stats->udp443_seen.load()) +
                 L" | NAT 碰撞 " + std::to_wstring(stats->nat_collision.load()) +
                 L" | DNS 池复用失败 " +
@@ -1375,6 +1480,12 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" 代理 " + std::to_wstring(stats->udp_proxy.load()) +
                 L" | 闸门重试 " + std::to_wstring(stats->connect_retry.load()) +
                 L" 成功 " + std::to_wstring(stats->connect_retry_ok.load()) +
+                L" | CONNECT p50 " + std::to_wstring(p50) +
+                L" p95 " + std::to_wstring(p95) +
+                L" 最大 " + std::to_wstring(cmax) + L"ms" +
+                L" | 零字节关闭 " + std::to_wstring(stats->tcp_zero_close.load()) +
+                L" 手机先关 " + std::to_wstring(stats->tcp_eof_remote.load()) +
+                L" 应用先关 " + std::to_wstring(stats->tcp_eof_app.load()) +
                 L" | 阻断 " + std::to_wstring(stats->blocked.load()) +
                 L" | 未代理泄漏 " + std::to_wstring(stats->leak.load()) +
                 L"（应为 0） | 接管审计 经引擎 " +
@@ -1543,9 +1654,13 @@ void ExpEngine::Impl::MainLoop() {
                     // address / destination port must NEVER be reused.
                     bool clash = NatEntryClashes(it->second, iph->SrcAddr,
                                                  ntohs(dport));
+                    // A dead flow's mapping must not block a legitimate
+                    // source-port reuse for minutes. `last` is refreshed by
+                    // EVERY packet of a live flow, so 15s of silence means
+                    // the flow is gone, not idle-long-lived.
                     bool stale = std::chrono::duration_cast<
                         std::chrono::seconds>(nat_now - it->second.last)
-                        .count() > 60;
+                        .count() > 15;
                     if (clash && stale) {
                         nat.erase(it);
                     } else {
@@ -1700,6 +1815,8 @@ void ExpEngine::Impl::MainLoop() {
                 if (ExpSocks5UdpSend(sess->assoc, dst_ip, dport,
                                      static_cast<const uint8_t*>(data),
                                      static_cast<int>(dlen))) {
+                    sess->last_dst_ip.store(dst_ip);
+                    sess->last_dst_port.store(ntohs(dport));
                     stats->udp_sent.fetch_add(1);
                 } else {
                     stats->udp_drop.fetch_add(1);

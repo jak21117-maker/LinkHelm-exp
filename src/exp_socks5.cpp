@@ -82,7 +82,12 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     // later flows are starved and the app sees "connected, then dropped".
     // Bound every byte of the handshake. Data-plane sockets override this
     // with their own SO_RCVTIMEO, so this does not change stream behaviour.
-    DWORD tmo = 10000;
+    // beta0.1.6: the field log showed a CONNECT taking 10250ms while the
+    // reflected handshake had already told the app "connected". A single
+    // unresponsive phone handshake held a ConnectGate slot for 10s and
+    // starved every queued flow. 6s still tolerates a slow cellular uplink
+    // but bounds the damage; transient failures are retried by TcpWorker.
+    DWORD tmo = 6000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&tmo), sizeof(tmo));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
@@ -155,7 +160,7 @@ bool ExpSocks5Precheck(const std::string& phone_ip, uint16_t phone_port,
 SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
                            const ExpAuth& auth, uint32_t dst_ip_net,
                            uint16_t dst_port_net, std::string* err) {
-    SOCKET s = DialWithTimeout(phone_ip, phone_port, 5000, err);
+    SOCKET s = DialWithTimeout(phone_ip, phone_port, 3000, err);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
     if (!HandshakeAuth(s, auth, err)) {
         closesocket(s);
@@ -209,6 +214,7 @@ bool ExpSocks5UdpAssociate(const std::string& phone_ip, uint16_t phone_port,
     out->udp = INVALID_SOCKET;
     out->relay_ip = 0;
     out->relay_port = 0;
+    out->relay_unspecified = false;
     SOCKET ctrl = DialWithTimeout(phone_ip, phone_port, 5000, err);
     if (ctrl == INVALID_SOCKET) return false;
     if (!HandshakeAuth(ctrl, auth, err)) {
@@ -254,8 +260,12 @@ bool ExpSocks5UdpAssociate(const std::string& phone_ip, uint16_t phone_port,
         closesocket(ctrl);
         return false;
     }
-    // BND.ADDR 0.0.0.0 -> the relay lives on the phone itself
-    if (rip == 0) {
+    // BND.ADDR 0.0.0.0 (or a domain ATYP) -> the relay lives on the phone
+    // itself. Mark the endpoint as advisory: such servers frequently reply
+    // from a port other than BND.PORT. beta0.1.5 treated that as fatal and
+    // killed the receive thread on the first datagram.
+    bool unspecified = (rip == 0);
+    if (unspecified) {
         inet_pton(AF_INET, phone_ip.c_str(), &rip);
     }
     SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -279,6 +289,7 @@ bool ExpSocks5UdpAssociate(const std::string& phone_ip, uint16_t phone_port,
     out->udp = udp;
     out->relay_ip = rip;
     out->relay_port = rport;
+    out->relay_unspecified = unspecified;
     return true;
 }
 
@@ -314,20 +325,54 @@ int ExpSocks5UdpRecv(const ExpUdpAssoc& a, uint32_t* src_ip_net,
     int n = recvfrom(a.udp, reinterpret_cast<char*>(raw.data()),
                      static_cast<int>(raw.size()), 0,
                      reinterpret_cast<sockaddr*>(&from), &fl);
-    if (n < 10) return -1;
-    // endpoint validation: only accept datagrams from the relay we chose
-    if (from.sin_addr.s_addr != a.relay_ip ||
-        from.sin_port != a.relay_port)
-        return -1;
-    if (raw[2] != 0x00) return -1;  // FRAG != 0 unsupported by design
-    if (raw[3] != 0x01) return -1;  // relay must answer with IPv4
+    if (n == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        // A timeout is NOT an error: the receive thread must keep waiting.
+        if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) return 0;
+        return -1;  // real socket failure — the only fatal result
+    }
+    // beta0.1.6: every "unusable datagram" used to return -1, and
+    // UdpRecvThread treated n<=0 as "control connection died" and broke out
+    // of the loop FOREVER. One non-IPv4 / fragmented / foreign-port reply
+    // from the phone therefore killed UDP for that whole session — the field
+    // log froze at "回包 8" while "发送 9" kept growing. All of these are now
+    // distinct SKIP codes; only -1 may end the thread.
+    if (n < 10) return -2;
+    // Endpoint validation: the sender IP must be the phone. BND.PORT is
+    // advisory — with BND.ADDR=0.0.0.0 many servers reply from a different
+    // port, and even with an explicit BND.ADDR some implementations do.
+    // The embedded RSV/FRAG/ATYP/DST header already identifies the flow.
+    if (a.relay_ip != 0 && from.sin_addr.s_addr != a.relay_ip)
+        return -3;
+    if (raw[2] != 0x00) return -4;  // FRAG != 0 unsupported by design
+    if (raw[3] != 0x01) return -5;  // domain/IPv6 ATYP: skip, do not die
     std::memcpy(src_ip_net, raw.data() + 4, 4);
     std::memcpy(src_port_net, raw.data() + 8, 2);
     int plen = n - 10;
-    if (plen <= 0) return 0;
+    if (plen <= 0) return -2;
     if (plen > buf_len) plen = buf_len;
     std::memcpy(buf, raw.data() + 10, static_cast<size_t>(plen));
     return plen;
+}
+
+bool ExpSocks5UdpCtrlAlive(const ExpUdpAssoc& a) {
+    if (a.ctrl == INVALID_SOCKET) return false;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(a.ctrl, &rd);
+    timeval tv{0, 0};
+    int r = select(0, &rd, nullptr, nullptr, &tv);
+    if (r == 0) return true;           // nothing pending -> still alive
+    if (r == SOCKET_ERROR) return true;  // transient: keep a healthy assoc
+    char c = 0;
+    int n = recv(a.ctrl, &c, 1, MSG_PEEK);
+    if (n == 0) return false;          // FIN: RFC 1928 association is over
+    if (n == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) return true;
+        return false;
+    }
+    return true;                       // unexpected control data, still open
 }
 
 void ExpSocks5UdpClose(ExpUdpAssoc* a) {

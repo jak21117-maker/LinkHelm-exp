@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.1.5 self-test harness.
+// LinkHelm-exp beta0.1.6 self-test harness.
 //
 // This TU #includes the PRODUCTION exp_engine.cpp, so every function under
 // test is the exact same code that ships in LinkHelmExp.exe (no copies, no
@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -69,9 +70,13 @@ static std::atomic<bool> g_phone_on{true};
 // Simulates a loaded phone ProxyServer: ASSOCIATE takes seconds.
 static std::atomic<int> g_assoc_delay_ms{0};
 // beta0.1.5: the phone accepts the TCP connection, then dies before sending
-// the CONNECT reply ("CONNECT reply missing" in the field log). One-shot:
-// the very next CONNECT behaves normally, so the retry can be proven.
+// the CONNECT reply ("CONNECT reply missing" in the field log). Count-down:
+// the first N CONNECTs are dropped, then the phone answers normally, so a
+// multi-attempt retry can be proven deterministically.
 static std::atomic<int> g_transient_drop{0};
+// beta0.1.6: a saturated phone answers CONNECT slowly (3-10s in the field
+// log). Used to prove the flow still succeeds instead of being reset.
+static std::atomic<int> g_connect_delay_ms{0};
 
 // Build a DNS answer over the query (A -> 93.184.216.34, else empty).
 static std::vector<uint8_t> MockDnsAnswer(const uint8_t* q, int n) {
@@ -189,9 +194,16 @@ static void PhoneConn(SOCKET c) {
     }
     if (cmd != 0x01) { closesocket(c); return; }
 
+    // beta0.1.6: a saturated phone answers CONNECT slowly. Keep the TCP
+    // connection open while sleeping so the client's handshake timeout,
+    // retry policy and connect-latency instrumentation are all exercised.
+    int cd = g_connect_delay_ms.load();
+    if (cd > 0) Sleep((DWORD)cd);
+
     // beta0.1.5 transient-failure hook: drop the connection without any
-    // SOCKS5 reply, so the client sees "CONNECT reply missing".
-    if (g_transient_drop.load() > 0 && g_transient_drop.fetch_sub(1) == 1) {
+    // SOCKS5 reply, so the client sees "CONNECT reply missing". Count-down
+    // (fetch_sub > 0) supports N consecutive drops for the 3-attempt retry.
+    if (g_transient_drop.load() > 0 && g_transient_drop.fetch_sub(1) > 0) {
         closesocket(c);
         return;
     }
@@ -342,11 +354,21 @@ static uint32_t ResolveIpv4(const char* host) {
 }
 
 // ------------------------------------------------------------------ main
-int main() {
+int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
-    std::printf("=== LinkHelm-exp beta0.1.5 self-test (mock phone) ===\n");
+
+    // --phone-only keeps the mock phone running as a standalone SOCKS5
+    // server so tests/socks5_probe.exe can be exercised against it.
+    if (argc > 1 && std::strcmp(argv[1], "--phone-only") == 0) {
+        std::thread(MockPhone).detach();
+        std::printf("mock phone listening on 127.0.0.1:%u (auth u:p)\n",
+                    (unsigned)kPhonePort);
+        for (;;) Sleep(1000);
+    }
+
+    std::printf("=== LinkHelm-exp beta0.1.6 self-test (mock phone) ===\n");
     std::printf("sources under test: src/exp_engine.cpp + src/exp_socks5.cpp\n\n");
 
     std::thread(MockPhone).detach();
@@ -450,6 +472,121 @@ int main() {
                   "... port=" + std::to_string(ntohs(sport)));
             ExpSocks5UdpClose(&a);
         }
+    }
+
+    // ---- 4b. b0.1.6: ONE malformed relay datagram must NOT kill UDP ----
+    // Field log: "UDP 回包 8" froze forever while "UDP 发送 9" kept growing.
+    // Root cause: ExpSocks5UdpRecv returned -1 for any reply whose source
+    // port differed from BND.PORT (or had ATYP != IPv4 / FRAG != 0), and
+    // UdpRecvThread treated n<=0 as "control conn died" and broke out of the
+    // loop FOREVER. This reproduces that exact packet mix against the
+    // production SOCKS5 client + the production receive-decision predicate.
+    {
+        std::string err;
+        ExpUdpAssoc a{};
+        bool ok = ExpSocks5UdpAssociate("127.0.0.1", kPhonePort, auth, &a, &err);
+        Check(ok, "b0.1.6 UDP ASSOCIATE for malformed-datagram test", err);
+        if (ok) {
+            sockaddr_in mine{}; int ml = sizeof(mine);
+            getsockname(a.udp, (sockaddr*)&mine, &ml);
+            // a.udp is bound to INADDR_ANY, so getsockname() reports
+            // 0.0.0.0. Sending to 0.0.0.0 on Windows does not loop back —
+            // pin the destination to 127.0.0.1 and keep only the port.
+            sockaddr_in target{};
+            target.sin_family = AF_INET;
+            target.sin_addr.s_addr = inet_addr("127.0.0.1");
+            target.sin_port = mine.sin_port;
+            // A rogue local socket whose source port is deliberately NOT
+            // relay_port — the exact shape that killed beta0.1.5.
+            SOCKET rogue = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            sockaddr_in rl{};
+            rl.sin_family = AF_INET;
+            rl.sin_addr.s_addr = inet_addr("127.0.0.1");
+            rl.sin_port = 0;
+            bind(rogue, (sockaddr*)&rl, sizeof(rl));
+            sockaddr_in rlb{}; int rlbl = sizeof(rlb);
+            getsockname(rogue, (sockaddr*)&rlb, &rlbl);
+            Check(rlb.sin_port != a.relay_port,
+                  "b0.1.6 rogue relay source port differs from BND.PORT",
+                  "rogue=" + std::to_string(ntohs(rlb.sin_port)) +
+                  " bnd=" + std::to_string(ntohs(a.relay_port)));
+            DWORD tmo = 800;
+            setsockopt(a.udp, SOL_SOCKET, SO_RCVTIMEO,
+                       (const char*)&tmo, sizeof(tmo));
+            auto SendRogue = [&](std::initializer_list<int> bytes) {
+                std::vector<uint8_t> d(bytes.begin(), bytes.end());
+                sendto(rogue, (const char*)d.data(), (int)d.size(), 0,
+                       (sockaddr*)&target, sizeof(target));
+            };
+            uint8_t back[512]; uint32_t sip = 0; uint16_t sport = 0;
+
+            SendRogue({0, 0, 0, 3, 3, 'a', 'b', 'c', 0x12, 0x34, 'X'});
+            int n1 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
+            Check(n1 == -5 && ClassifyUdpRecv(n1) == UdpRecvDecision::kSkip,
+                  "domain ATYP reply is SKIPPED (thread survives)",
+                  "rc=" + std::to_string(n1));
+
+            SendRogue({0, 0, 1, 1, 8, 8, 8, 8, 0x12, 0x34, 'Y'});
+            int n2 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
+            Check(n2 == -4 && ClassifyUdpRecv(n2) == UdpRecvDecision::kSkip,
+                  "FRAG!=0 reply is SKIPPED (thread survives)",
+                  "rc=" + std::to_string(n2));
+
+            SendRogue({0, 0});
+            int n3 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
+            Check(n3 == -2 && ClassifyUdpRecv(n3) == UdpRecvDecision::kSkip,
+                  "short reply is SKIPPED (thread survives)",
+                  "rc=" + std::to_string(n3));
+
+            // The decisive one: a VALID datagram from a DIFFERENT relay port
+            // must still be delivered after all three skips.
+            SendRogue({0, 0, 0, 1, 8, 8, 8, 8, 0x12, 0x34, 'O', 'K'});
+            int n4 = ExpSocks5UdpRecv(a, &sip, &sport, back, sizeof(back));
+            Check(n4 == 2 && memcmp(back, "OK", 2) == 0 &&
+                      sip == inet_addr("8.8.8.8") && sport == htons(0x1234),
+                  "b0.1.6 valid reply from a DIFFERENT relay port is received",
+                  "rc=" + std::to_string(n4) +
+                  " port=" + std::to_string(ntohs(sport)));
+
+            Check(ClassifyUdpRecv(-1) == UdpRecvDecision::kExit &&
+                      ClassifyUdpRecv(0) == UdpRecvDecision::kSkip &&
+                      ClassifyUdpRecv(10) == UdpRecvDecision::kForward,
+                  "only a real socket error (-1) may end the receive thread");
+            closesocket(rogue);
+            ExpSocks5UdpClose(&a);
+        }
+    }
+
+    // ---- 4c. b0.1.6: dead ASSOCIATE control conn is detected ----------
+    // RFC 1928: closing the TCP control connection ends the UDP association.
+    // 0.1.5 never checked it → session silently became send-only.
+    {
+        SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in la{};
+        la.sin_family = AF_INET;
+        la.sin_addr.s_addr = inet_addr("127.0.0.1");
+        la.sin_port = 0;
+        bind(ln, (sockaddr*)&la, sizeof(la));
+        listen(ln, 2);
+        sockaddr_in got{}; int gl = sizeof(got);
+        getsockname(ln, (sockaddr*)&got, &gl);
+        SOCKET cli = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        connect(cli, (sockaddr*)&got, sizeof(got));
+        SOCKET srv = accept(ln, nullptr, nullptr);
+        Check(cli != INVALID_SOCKET && srv != INVALID_SOCKET,
+              "b0.1.6 control-conn liveness socket pair");
+        if (cli != INVALID_SOCKET && srv != INVALID_SOCKET) {
+            ExpUdpAssoc fake{};
+            fake.ctrl = srv;
+            Check(ExpSocks5UdpCtrlAlive(fake),
+                  "ASSOCIATE control conn alive while peer is open");
+            closesocket(cli);           // peer sends FIN
+            Sleep(80);
+            Check(!ExpSocks5UdpCtrlAlive(fake),
+                  "b0.1.6 peer FIN detected → association must rebuild");
+            closesocket(srv);
+        }
+        closesocket(ln);
     }
 
     // ---- 5. Production TCP session pump (TcpWorker) -----------------
@@ -802,24 +939,27 @@ int main() {
             int l1 = sizeof(rto), l2 = sizeof(sto);
             getsockopt(ctl, SOL_SOCKET, SO_RCVTIMEO, (char*)&rto, &l1);
             getsockopt(ctl, SOL_SOCKET, SO_SNDTIMEO, (char*)&sto, &l2);
-            Check(rto == 10000, "control SO_RCVTIMEO=10s (no infinite stall)",
+            Check(rto == 6000, "b0.1.6 control SO_RCVTIMEO=6s (bounds a stalled phone)",
                   std::to_string(rto));
-            Check(sto == 10000, "control SO_SNDTIMEO=10s",
+            Check(sto == 6000, "b0.1.6 control SO_SNDTIMEO=6s",
                   std::to_string(sto));
             closesocket(ctl);
         }
 
-        // (2) Gate is 8 concurrent handshakes; the 9th QUEUES instead of
-        // adding a 25th CONNECT to an already saturated phone.
+        // (2) b0.1.6: the gate is THREE concurrent handshakes. The field
+        // log proved 8 already saturated the phone (3x "reply missing",
+        // 3094ms / 10250ms CONNECTs). The 4th QUEUES instead of dialling.
         static ConnectGate gq;
         static std::atomic<bool> gq_alive{true};
+        Check(gq.cap == 3, "b0.1.6 gate cap is 3 (phone-safe concurrency)",
+              std::to_string(gq.cap));
         int acquired = 0;
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < 3; ++i)
             if (gq.Acquire(&gq_alive, 100)) ++acquired;
-        Check(acquired == 8, "gate allows exactly 8 concurrent CONNECTs",
+        Check(acquired == 3, "gate allows exactly 3 concurrent CONNECTs",
               std::to_string(acquired));
         Check(!gq.Acquire(&gq_alive, 60),
-              "9th handshake QUEUES (never dials a saturated phone)");
+              "4th handshake QUEUES (never dials a saturated phone)");
         std::atomic<bool> got{false};
         std::thread waiter([&gq, &got] {
             got.store(gq.Acquire(&gq_alive, 3000));
@@ -829,7 +969,7 @@ int main() {
         gq.Release();
         waiter.join();
         Check(got.load(), "queued handshake proceeds once a slot frees");
-        for (int i = 0; i < 8; ++i) gq.Release();
+        for (int i = 0; i < 3; ++i) gq.Release();
 
         // (3) One transient "CONNECT reply missing" must be retried and
         // recovered, then finalized exactly once.
@@ -885,6 +1025,115 @@ int main() {
         }
         closesocket(ln3);
         g_transient_drop.store(0);
+    }
+
+    // ---- 6c. b0.1.6: 3-attempt retry / slow phone must NOT drop --------
+    // Field log: 3x "CONNECT reply missing" and a 10250ms CONNECT. The
+    // reflected handshake has already told the app "connected", so a failed
+    // or very slow CONNECT shows up as "通了又关" / "很卡".
+    {
+        auto RunFlow = [&](uint64_t fid, uint32_t dst, uint16_t dport,
+                           std::shared_ptr<EngineStats> stx,
+                           TcpRegistry* regx, ConnectGate* gatex,
+                           std::atomic<bool>* stopx,
+                           std::atomic<int>* budgetx, SOCKET* out_app) {
+            SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            sockaddr_in la{};
+            la.sin_family = AF_INET;
+            la.sin_addr.s_addr = inet_addr("127.0.0.1");
+            la.sin_port = 0;
+            bind(ln, (sockaddr*)&la, sizeof(la));
+            listen(ln, 4);
+            sockaddr_in got{}; int gl = sizeof(got);
+            getsockname(ln, (sockaddr*)&got, &gl);
+            SOCKET app = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            connect(app, (sockaddr*)&got, sizeof(got));
+            SOCKET acc = accept(ln, nullptr, nullptr);
+            closesocket(ln);
+            if (acc == INVALID_SOCKET) { closesocket(app); return false; }
+            auto sess = std::make_shared<TcpSession>();
+            sess->client.store(acc);
+            sess->budget = budgetx;
+            budgetx->fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lk(regx->mtx);
+                regx->live.push_back(sess);
+            }
+            NatEntry ne{};
+            ne.orig_dst_ip = ntohl(dst);
+            ne.orig_dst_port = dport;
+            ne.app_ip = inet_addr("127.0.0.1");
+            ne.flow_id = fid;
+            std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
+                        kPhonePort, auth, fid, logfn, regx, stx,
+                        gatex, stopx, budgetx).detach();
+            *out_app = app;
+            return true;
+        };
+
+        // (1) TWO consecutive dropped CONNECT replies -> 3rd attempt wins.
+        g_transient_drop.store(2);
+        auto st4 = std::make_shared<EngineStats>();
+        static TcpRegistry reg4;
+        static ConnectGate gate4;
+        static std::atomic<bool> stop4{true};
+        static std::atomic<int> budget4{0};
+        SOCKET app4 = INVALID_SOCKET;
+        bool l4 = RunFlow(800, inet_addr("223.5.5.5"), 53,
+                          st4, &reg4, &gate4, &stop4, &budget4, &app4);
+        Check(l4, "b0.1.6 retry flow reflection socket pair");
+        if (l4) {
+            for (int i = 0; i < 200 &&
+                 st4->socks_ok.load() == 0 && st4->socks_fail.load() == 0;
+                 ++i) Sleep(50);
+            Check(st4->connect_retry.load() == 1,
+                  "b0.1.6 transient failures counted as one retrying flow",
+                  std::to_string(st4->connect_retry.load()));
+            Check(st4->connect_retry_ok.load() == 1 &&
+                      st4->socks_ok.load() == 1,
+                  "b0.1.6 3-attempt policy recovers after TWO drops",
+                  "ok=" + std::to_string(st4->socks_ok.load()) +
+                  " fail=" + std::to_string(st4->socks_fail.load()));
+            closesocket(app4);
+            for (int i = 0; i < 100 && budget4.load() > 0; ++i) Sleep(50);
+            Check(budget4.load() == 0 && reg4.live.empty(),
+                  "b0.1.6 3-attempt success path finalizes once");
+        }
+        g_transient_drop.store(0);
+
+        // (2) A 900ms phone still completes; latency is recorded for p50/p95.
+        g_connect_delay_ms.store(900);
+        auto st5 = std::make_shared<EngineStats>();
+        static TcpRegistry reg5;
+        static ConnectGate gate5;
+        static std::atomic<bool> stop5{true};
+        static std::atomic<int> budget5{0};
+        SOCKET app5 = INVALID_SOCKET;
+        bool l5 = RunFlow(801, inet_addr("223.5.5.5"), 53,
+                          st5, &reg5, &gate5, &stop5, &budget5, &app5);
+        Check(l5, "b0.1.6 slow-phone flow reflection socket pair");
+        if (l5) {
+            for (int i = 0; i < 200 &&
+                 st5->socks_ok.load() == 0 && st5->socks_fail.load() == 0;
+                 ++i) Sleep(50);
+            Check(st5->socks_ok.load() == 1,
+                  "b0.1.6 slow phone (900ms) CONNECT still succeeds, no reset",
+                  "ok=" + std::to_string(st5->socks_ok.load()) +
+                  " fail=" + std::to_string(st5->socks_fail.load()));
+            int last_ms = -1;
+            {
+                std::lock_guard<std::mutex> lk(st5->connect_ms_mtx);
+                if (!st5->connect_ms.empty()) last_ms = st5->connect_ms.back();
+            }
+            Check(last_ms >= 850,
+                  "b0.1.6 CONNECT latency recorded for p50/p95 diagnostics",
+                  std::to_string(last_ms) + "ms");
+            closesocket(app5);
+            for (int i = 0; i < 100 && budget5.load() > 0; ++i) Sleep(50);
+            Check(budget5.load() == 0 && reg5.live.empty(),
+                  "b0.1.6 slow-phone path finalizes once");
+        }
+        g_connect_delay_ms.store(0);
     }
 
     // ---- 7. WinDivert filter compile + packet evaluation --------------

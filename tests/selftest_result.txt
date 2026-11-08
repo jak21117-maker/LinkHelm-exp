@@ -1,4 +1,4 @@
-=== LinkHelm-exp beta0.1.5 self-test (mock phone) ===
+=== LinkHelm-exp beta0.1.6 self-test (mock phone) ===
 sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 
 [PASS] SOCKS5 RFC1929 auth precheck                         
@@ -12,6 +12,16 @@ sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 [PASS] SOCKS5 UDP ASSOCIATE succeeds                        
 [PASS] UDP datagram sent through ASSOCIATE                  
 [PASS] UDP reply carries ORIGINAL remote endpoint           src_ip=8... port=9999
+[PASS] b0.1.6 UDP ASSOCIATE for malformed-datagram test     
+[PASS] b0.1.6 rogue relay source port differs from BND.PORT rogue=51377 bnd=51375
+[PASS] domain ATYP reply is SKIPPED (thread survives)       rc=-5
+[PASS] FRAG!=0 reply is SKIPPED (thread survives)           rc=-4
+[PASS] short reply is SKIPPED (thread survives)             rc=-2
+[PASS] b0.1.6 valid reply from a DIFFERENT relay port is received rc=2 port=4660
+[PASS] only a real socket error (-1) may end the receive thread 
+[PASS] b0.1.6 control-conn liveness socket pair             
+[PASS] ASSOCIATE control conn alive while peer is open      
+[PASS] b0.1.6 peer FIN detected → association must rebuild 
 [PASS] local reflection socket pair created                 
 [PASS] TcpWorker pump: request+response through phone       HTTP/1.0 200 OK
 [PASS] TcpWorker reports CONNECT success                    
@@ -32,8 +42,8 @@ sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 [PASS] F02 failed injection counted (attempt=1 fail=1)      
 [PASS] F02 successful injection counted (ok=1)              
 [PASS] F01 UDP session is INITIALIZING while the phone handshakes 
-[PASS] F01 new TCP completes while UDP ASSOCIATE is still pending 1ms
-[PASS] F01 session becomes READY after the slow handshake   1059ms
+[PASS] F01 new TCP completes while UDP ASSOCIATE is still pending 16ms
+[PASS] F01 session becomes READY after the slow handshake   1073ms
 [PASS] F01 queued first datagrams flushed in order after READY sent=3
 [PASS] F01 recv thread ran (stub WD)                        
 [PASS] §5.1 phone-as-DNS remapped to public resolver       
@@ -60,16 +70,25 @@ sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 [PASS] empty DNS reply keeps question, 0 answers            
 [PASS] NAT key {dst_ip,src_port} ordering                   
 [PASS] beta0.1.5 control CONNECT succeeds                   
-[PASS] control SO_RCVTIMEO=10s (no infinite stall)          10000
-[PASS] control SO_SNDTIMEO=10s                              10000
-[PASS] gate allows exactly 8 concurrent CONNECTs            8
-[PASS] 9th handshake QUEUES (never dials a saturated phone) 
+[PASS] b0.1.6 control SO_RCVTIMEO=6s (bounds a stalled phone) 6000
+[PASS] b0.1.6 control SO_SNDTIMEO=6s                        6000
+[PASS] b0.1.6 gate cap is 3 (phone-safe concurrency)        3
+[PASS] gate allows exactly 3 concurrent CONNECTs            3
+[PASS] 4th handshake QUEUES (never dials a saturated phone) 
 [PASS] waiter stays queued while the gate is full           
 [PASS] queued handshake proceeds once a slot frees          
 [PASS] retry-test reflection socket pair                    
 [PASS] transient CONNECT failure triggers one retry         1
 [PASS] retry recovers the session (phone answers 2nd dial)  
 [PASS] retry path finalizes exactly once (live=0, budget=0) 
+[PASS] b0.1.6 retry flow reflection socket pair             
+[PASS] b0.1.6 transient failures counted as one retrying flow 1
+[PASS] b0.1.6 3-attempt policy recovers after TWO drops     ok=1 fail=0
+[PASS] b0.1.6 3-attempt success path finalizes once         
+[PASS] b0.1.6 slow-phone flow reflection socket pair        
+[PASS] b0.1.6 slow phone (900ms) CONNECT still succeeds, no reset ok=1 fail=0
+[PASS] b0.1.6 CONNECT latency recorded for p50/p95 diagnostics 917ms
+[PASS] b0.1.6 slow-phone path finalizes once                
 [PASS] WinDivert.dll loads (helper API, no driver)          
 [PASS] WinDivert filter helper exports present              
 [PASS] beta0.1.5 filter (!impostor) compiles                OK
@@ -97,4 +116,4 @@ sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 [PASS] phone SOCKS5 endpoint excluded (no proxy loop)       
 [INFO] WinDivertOpen err=5 (no elevation here); driver-layer injection must be verified on the target PC. Not counted as a test failure.
 
-=== RESULT: 77 passed, 0 failed ===
+=== RESULT: 96 passed, 0 failed ===
