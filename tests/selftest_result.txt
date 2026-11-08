@@ -1,4 +1,4 @@
-=== LinkHelm-exp beta0.1.4 self-test (mock phone) ===
+=== LinkHelm-exp beta0.1.5 self-test (mock phone) ===
 sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 
 [PASS] SOCKS5 RFC1929 auth precheck                         
@@ -26,14 +26,14 @@ sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 [PASS] F03 budget back to 0 after 100 failures              budget=0
 [PASS] F04 grants slots up to the cap                       
 [PASS] F04 saturated gate REFUSES (no 25th CONNECT to the phone) 
-[PASS] F04 refusal waits out the timeout                    261ms
+[PASS] F04 refusal waits out the timeout                    262ms
 [PASS] F04 a released slot is reusable                      
 [PASS] F04 Stop() wakes a queued handshake immediately      154ms
 [PASS] F02 failed injection counted (attempt=1 fail=1)      
 [PASS] F02 successful injection counted (ok=1)              
 [PASS] F01 UDP session is INITIALIZING while the phone handshakes 
-[PASS] F01 new TCP completes while UDP ASSOCIATE is still pending 19ms
-[PASS] F01 session becomes READY after the slow handshake   1074ms
+[PASS] F01 new TCP completes while UDP ASSOCIATE is still pending 1ms
+[PASS] F01 session becomes READY after the slow handshake   1059ms
 [PASS] F01 queued first datagrams flushed in order after READY sent=3
 [PASS] F01 recv thread ran (stub WD)                        
 [PASS] §5.1 phone-as-DNS remapped to public resolver       
@@ -59,19 +59,42 @@ sources under test: src/exp_engine.cpp + src/exp_socks5.cpp
 [PASS] AAAA query detected                                  
 [PASS] empty DNS reply keeps question, 0 answers            
 [PASS] NAT key {dst_ip,src_port} ordering                   
+[PASS] beta0.1.5 control CONNECT succeeds                   
+[PASS] control SO_RCVTIMEO=10s (no infinite stall)          10000
+[PASS] control SO_SNDTIMEO=10s                              10000
+[PASS] gate allows exactly 8 concurrent CONNECTs            8
+[PASS] 9th handshake QUEUES (never dials a saturated phone) 
+[PASS] waiter stays queued while the gate is full           
+[PASS] queued handshake proceeds once a slot frees          
+[PASS] retry-test reflection socket pair                    
+[PASS] transient CONNECT failure triggers one retry         1
+[PASS] retry recovers the session (phone answers 2nd dial)  
+[PASS] retry path finalizes exactly once (live=0, budget=0) 
 [PASS] WinDivert.dll loads (helper API, no driver)          
 [PASS] WinDivert filter helper exports present              
-[PASS] beta0.1.3 filter (with IPv6) compiles                OK
+[PASS] beta0.1.5 filter (!impostor) compiles                OK
+[PASS] impostor is a legal WinDivert filter token           
 [probe] outbound                                 IPv6 packet = TRUE
 [probe] ipv6                                     IPv6 packet = TRUE
 [probe] outbound and ipv6                        IPv6 packet = TRUE
 [probe] outbound and !loopback and ipv6          IPv6 packet = TRUE
 [probe] ip                                       IPv6 packet = FALSE
 [probe] tcp                                      IPv6 packet = TRUE
-[PASS] new filter CAPTURES global IPv6 egress               
-[PASS] old filter MISSED IPv6 (confirms leak root cause)    
-[PASS] new filter CAPTURES public IPv4 TCP                  
+[PASS] beta0.1.5 filter CAPTURES global IPv6 egress         
+[PASS] beta0.1.2 filter MISSED IPv6 (historical leak)       
+[PASS] injected IPv6 packet is NOT re-captured (loop guard) 
+[PASS] beta0.1.5 filter CAPTURES public IPv4 TCP            
+[PASS] beta0.1.5 EXCLUDES reinjected packet (no capture loop) 
+[PASS] beta0.1.4 RE-CAPTURED reinjected packet (loop root cause) 
+[reply-probe] tcp                                        = TRUE
+[reply-probe] tcp.SrcPort == 7712                        = TRUE
+[reply-probe] !impostor                                  = TRUE
+[reply-probe] tcp.SrcPort == 7712 and !impostor          = TRUE
+[reply-probe] loopback                                   = TRUE
+[reply-probe] inbound                                    = TRUE
+[PASS] beta0.1.5 CAPTURES listener reply in any direction   
+[PASS] beta0.1.4 MISSED non-outbound listener reply         
 [PASS] phone SOCKS5 endpoint excluded (no proxy loop)       
 [INFO] WinDivertOpen err=5 (no elevation here); driver-layer injection must be verified on the target PC. Not counted as a test failure.
 
-=== RESULT: 60 passed, 0 failed ===
+=== RESULT: 77 passed, 0 failed ===

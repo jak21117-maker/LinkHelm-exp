@@ -320,7 +320,13 @@ struct ConnectGate {
     std::mutex m;
     std::condition_variable cv;
     int cur = 0;
-    int cap = 24;
+    // beta0.1.5: the field log showed 28 CONNECTs opened within ~2s and the
+    // phone's ProxyServer stopped answering four of them ("CONNECT reply
+    // missing") while the reflected handshake had already told the app it
+    // was connected. 24 concurrent handshakes is far beyond what a Kotlin
+    // phone-side thread pool sustains. Serialise to 8 and QUEUE the rest
+    // (20s) instead of cancelling them — slow is better than a dead socket.
+    int cap = 8;
 
     bool Acquire(std::atomic<bool>* stop, int timeout_ms) {
         std::unique_lock<std::mutex> lk(m);
@@ -370,6 +376,20 @@ struct EngineStats {
     std::atomic<uint64_t> inject_ok{0};
     std::atomic<uint64_t> inject_fail{0};
     std::atomic<uint64_t> gate_timeout{0};   // F04: cancelled, no CONNECT
+    std::atomic<uint64_t> connect_retry{0};  // beta0.1.5: transient retry
+    std::atomic<uint64_t> connect_retry_ok{0};
+    // beta0.1.5: prove UDP is actually taken over. The old stats were all
+    // zero because every UDP datagram that reached the LAN-bypass branch
+    // was silently reinjected and counted nowhere.
+    std::atomic<uint64_t> udp_capture{0};    // all UDP packets captured
+    std::atomic<uint64_t> udp_lan_pass{0};   // LAN/multicast, intentionally not proxied
+    std::atomic<uint64_t> udp_proxy{0};      // handed to SOCKS5 UDP ASSOCIATE
+    // Independent, OUTSIDE-the-engine evidence of full TCP takeover. The
+    // engine's own leak==0 only counts packets it saw; it cannot prove a
+    // packet it never captured. This audit enumerates the OS TCP table.
+    std::atomic<uint64_t> audit_total{0};
+    std::atomic<uint64_t> audit_managed{0};
+    std::atomic<uint64_t> audit_unmanaged{0};
     std::atomic<uint64_t> udp_assoc_ok{0};
     std::atomic<uint64_t> udp_assoc_fail{0};
     std::atomic<uint64_t> udp_sent{0};
@@ -740,7 +760,7 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     // saturated we cancel instead of adding a 25th handshake to a phone that
     // is already answering REP=0x05 / 3-5s. The wait is cancellable, so
     // Stop()/FAULTED never hangs behind a queued handshake.
-    if (!gate->Acquire(stop, 8000)) {
+    if (!gate->Acquire(stop, 20000)) {
         stats->gate_timeout.fetch_add(1);
         log(L"[exp] #" + std::to_wstring(flow_id) +
             L" 并发闸门超时或引擎停止 → 取消（未向手机发起 CONNECT）→ " +
@@ -748,12 +768,39 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
         SessionFinalize(s, reg, stats, budget);
         return;
     }
+    // beta0.1.5: one retry for TRANSIENT handshake failures only. A phone
+    // under load sometimes accepts the TCP connection, then drops it before
+    // answering CONNECT; an immediate second dial succeeds. An explicit
+    // REP != 0x00 (refused/unreachable) is NOT retried — that is a real
+    // server-side verdict, not a transient loss.
     std::string err;
-    s->remote.store(ExpSocks5TcpConnect(phone_ip, phone_port, auth,
-                                        htonl(entry.orig_dst_ip),
-                                        htons(entry.orig_dst_port), &err));
+    SOCKET r = INVALID_SOCKET;
+    constexpr int kMaxConnectAttempts = 2;
+    for (int attempt = 0; attempt < kMaxConnectAttempts; ++attempt) {
+        // NOTE: this pointer is &Impl::running (true == engine RUNNING),
+        // despite the historical parameter name "stop". A stopped engine
+        // must NOT start another handshake.
+        if (!stop->load()) break;
+        err.clear();
+        r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
+                                htonl(entry.orig_dst_ip),
+                                htons(entry.orig_dst_port), &err);
+        if (r != INVALID_SOCKET) {
+            if (attempt > 0) stats->connect_retry_ok.fetch_add(1);
+            break;
+        }
+        if (attempt == 0) stats->connect_retry.fetch_add(1);
+        bool transient =
+            err.find("reply missing") != std::string::npos ||
+            err.find("timeout") != std::string::npos ||
+            err.find("timed out") != std::string::npos ||
+            err.find("unreachable") != std::string::npos ||
+            err.find("send failed") != std::string::npos;
+        if (!transient) break;
+        Sleep(150);
+    }
     gate->Release();
-    if (s->remote.load() == INVALID_SOCKET) {
+    if (r == INVALID_SOCKET) {
         // Surface the failure to the app as an immediate disconnect (never
         // fake "connected"): the plan document's observable-failure rule.
         stats->socks_fail.fetch_add(1);
@@ -762,6 +809,7 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
         SessionFinalize(s, reg, stats, budget);
         return;
     }
+    s->remote.store(r);
     stats->socks_ok.fetch_add(1);
     int ms = static_cast<int>(std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
@@ -1144,6 +1192,7 @@ struct ExpEngine::Impl {
     void MainLoop();
     void AcceptLoop();
     void ExpireLoop();
+    void AuditTcpTakeover();
 };
 
 void ExpEngine::Impl::AcceptLoop() {
@@ -1195,6 +1244,71 @@ void ExpEngine::Impl::AcceptLoop() {
     listener = INVALID_SOCKET;
 }
 
+// beta0.1.5 — INDEPENDENT evidence of full TCP takeover.
+//
+// The engine's own "未代理泄漏 0" is self-referential: it only counts packets
+// WinDivert actually handed us. A packet that never matched the capture
+// filter is invisible to EVERY internal counter, so leak==0 cannot prove
+// "everything was proxied" — it merely proves "we handled what we saw".
+// This audit reads a different data source (the OS TCP table) and matches
+// every established public connection against our NAT table. Anything
+// unmatched is a REAL unproxied egress and the physical cause of "IP 跳动".
+void ExpEngine::Impl::AuditTcpTakeover() {
+    ULONG sz = 0;
+    if (GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) !=
+            ERROR_INSUFFICIENT_BUFFER ||
+        sz == 0)
+        return;
+    std::vector<uint8_t> buf(sz);
+    auto* tbl = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    if (GetExtendedTcpTable(tbl, &sz, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR)
+        return;
+    const DWORD self = GetCurrentProcessId();
+    uint64_t total = 0, managed = 0, unmanaged = 0;
+    std::wstring detail;
+    for (DWORD i = 0; i < tbl->dwNumEntries; ++i) {
+        const MIB_TCPROW_OWNER_PID& r = tbl->table[i];
+        if (r.dwState != MIB_TCP_STATE_ESTAB) continue;
+        if (r.dwOwningPid == self) continue;   // our own relay/control sockets
+        uint32_t remote_net = static_cast<uint32_t>(r.dwRemoteAddr);
+        if (IsBypassDst(remote_net)) continue;  // LAN / multicast / loopback
+        ++total;
+        NatKey key{ntohl(remote_net),
+                   ntohs(static_cast<uint16_t>(r.dwLocalPort))};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(nat_mtx);
+            found = nat.find(key) != nat.end();
+        }
+        if (found) { ++managed; continue; }
+        ++unmanaged;
+        if (unmanaged <= 3) {
+            in_addr a;
+            a.s_addr = remote_net;
+            char ip[32] = "";
+            inet_ntop(AF_INET, &a, ip, sizeof(ip));
+            detail += L" " + FromUtf8(ip) + L":" +
+                std::to_wstring(ntohs(static_cast<uint16_t>(r.dwRemotePort))) +
+                L"(pid " + std::to_wstring(r.dwOwningPid) + L")";
+        }
+    }
+    stats->audit_total.store(total);
+    stats->audit_managed.store(managed);
+    stats->audit_unmanaged.store(unmanaged);
+    if (unmanaged > 0) {
+        log(L"[exp] 接管审计: 本机公网 TCP 已建立 " +
+            std::to_wstring(total) + L" 条 | 经本引擎 " +
+            std::to_wstring(managed) + L" 条 | 未代理 " +
+            std::to_wstring(unmanaged) +
+            L" 条 → 这些连接由系统直连出站，出口 IP 会与手机不一致：" + detail);
+    } else {
+        log(L"[exp] 接管审计: 本机公网 TCP 已建立 " +
+            std::to_wstring(total) + L" 条 | 全部经本引擎（未代理 0）");
+    }
+}
+
 void ExpEngine::Impl::ExpireLoop() {
     int ticks = 0;
     while (running.load()) {
@@ -1230,6 +1344,7 @@ void ExpEngine::Impl::ExpireLoop() {
         }
         // plan §5.3: aggregate session-closure evidence every ~10s
         if (ticks % 10 == 0) {
+            AuditTcpTakeover();   // independent, OS-table-based proof
             const wchar_t* st = StateName(state.load());
             log(L"[exp] 统计[" + std::wstring(st) + L"]: TCP 活动 " +
                 std::to_wstring(tcp_budget.load()) +
@@ -1255,8 +1370,17 @@ void ExpEngine::Impl::ExpireLoop() {
                 std::to_wstring(stats->dns_pool_reuse_fail.load()) +
                 L" 重拨成功 " + std::to_wstring(stats->dns_pool_redial_ok.load()) +
                 L" | IPv6 阻断 " + std::to_wstring(stats->ipv6_drop.load()) +
+                L" | UDP 捕获 " + std::to_wstring(stats->udp_capture.load()) +
+                L" 局域网 " + std::to_wstring(stats->udp_lan_pass.load()) +
+                L" 代理 " + std::to_wstring(stats->udp_proxy.load()) +
+                L" | 闸门重试 " + std::to_wstring(stats->connect_retry.load()) +
+                L" 成功 " + std::to_wstring(stats->connect_retry_ok.load()) +
                 L" | 阻断 " + std::to_wstring(stats->blocked.load()) +
                 L" | 未代理泄漏 " + std::to_wstring(stats->leak.load()) +
+                L"（应为 0） | 接管审计 经引擎 " +
+                std::to_wstring(stats->audit_managed.load()) + L"/" +
+                std::to_wstring(stats->audit_total.load()) +
+                L" 未代理 " + std::to_wstring(stats->audit_unmanaged.load()) +
                 L"（应为 0）");
         }
     }
@@ -1284,6 +1408,19 @@ void ExpEngine::Impl::MainLoop() {
             break;
         }
         stats->recv_ok.fetch_add(1);
+        // Defence in depth: an injected packet that somehow still reaches
+        // this handle must be released EXACTLY ONCE and never re-processed
+        // (otherwise a LAN-bypass reinjection loops forever). Reinjecting
+        // here with the same address lets it continue up the stack; the
+        // !impostor filter branch above normally prevents this entirely.
+        if (addr.Impostor) {
+            stats->inject_attempt.fetch_add(1);
+            UINT sent = 0;
+            BOOL ok = wd.send(divert, pkt.data(), len, &sent, &addr);
+            if (ok && sent == len) stats->inject_ok.fetch_add(1);
+            else stats->inject_fail.fetch_add(1);
+            continue;
+        }
         WINDIVERT_IPHDR* iph = nullptr;
         WINDIVERT_IPV6HDR* ip6 = nullptr;
         WINDIVERT_TCPHDR* tcph = nullptr;
@@ -1313,6 +1450,7 @@ void ExpEngine::Impl::MainLoop() {
         uint32_t dst_ip = iph->DstAddr;          // network order
         uint16_t sport = tcph ? tcph->SrcPort : (udph ? udph->SrcPort : 0);
         uint16_t dport = tcph ? tcph->DstPort : (udph ? udph->DstPort : 0);
+        if (udph) stats->udp_capture.fetch_add(1);
 
         // ---- listener return path (loopback, SrcPort == local_port) ----
         if (tcph && ntohs(sport) == local_port) {
@@ -1354,6 +1492,7 @@ void ExpEngine::Impl::MainLoop() {
         // no server at all. Relay every query over TCP through the phone's
         // SOCKS5 (DNS-over-TCP, RFC 7766) — no UDP ASSOCIATE needed.
         if (udph && ntohs(dport) == 53 && data && dlen > 0) {
+            stats->udp_proxy.fetch_add(1);  // relayed over SOCKS5 TCP DNS
             // vector is copied into the thread — the packet buffer itself
             // must never be referenced after MainLoop moves on
             std::vector<uint8_t> q(static_cast<const uint8_t*>(data),
@@ -1384,6 +1523,7 @@ void ExpEngine::Impl::MainLoop() {
 
         // ---- policy: never capture LAN/multicast/broadcast ----
         if (IsBypassDst(dst_ip)) {
+            if (udph) stats->udp_lan_pass.fetch_add(1);
             WdInject(divert, wd, pkt.data(), len, &addr, L"局域网放行", 0, stats,
                      log);
             continue;
@@ -1473,6 +1613,7 @@ void ExpEngine::Impl::MainLoop() {
         }
 
         if (udph && data && dlen > 0) {
+            stats->udp_proxy.fetch_add(1);  // handed to UDP ASSOCIATE
             // Plan §4.5: UDP:443 is NOT unconditionally dropped any more.
             // Browser QUIC and game traffic both use it; a silent global drop
             // hid game failures behind a "browser just falls back to TCP"
@@ -1763,12 +1904,25 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     // used `ip` only, so every IPv6 packet bypassed the engine and went out
     // natively — with two default routes on this machine that is exactly
     // the unproxied egress that made the public IP flap.
+    // beta0.1.5 — three concrete gaps in 0.1.4's filter:
+    //  * no `!impostor`: every packet we reinject UNCHANGED (LAN bypass,
+    //    local IPv6, stray loopback) is outbound, so it matched the filter
+    //    again and could be captured/reinjected indefinitely. The field log
+    //    shows recv_ok climbing 698 -> 870 -> 960 over 20s while every
+    //    business counter (TCP sessions, bytes, DNS, UDP) stayed frozen —
+    //    exactly that idle churn eating the capture queue.
+    //  * listener replies were restricted to `outbound`; a reply that the
+    //    stack classifies otherwise was never rewritten, so the app got a
+    //    packet addressed to 127.0.0.1/local_port and reset the flow.
+    //  * `outbound` on the IPv6 branch missed any inbound-classified egress.
+    // Verified with WinDivertHelperCompileFilter: `impostor` is a legal
+    // filter token on this WinDivert build.
     std::string filter =
-        "outbound and !loopback and ip.DstAddr != " + I->phone8 +
-        " and (tcp or udp)";
-    filter += " or (outbound and !loopback and ipv6)";
-    filter += " or (outbound and tcp.SrcPort == " +
-              std::to_string(I->local_port) + ")";
+        "(outbound and !loopback and !impostor and ip.DstAddr != " +
+        I->phone8 + " and (tcp or udp))";
+    filter += " or (outbound and !loopback and !impostor and ipv6)";
+    filter += " or (tcp.SrcPort == " + std::to_string(I->local_port) +
+              " and !impostor)";
 
     I->status(L"打开 WinDivert 捕获…");
     HANDLE h = I->wd.open(filter.c_str(), WINDIVERT_LAYER_NETWORK, 0, 0);

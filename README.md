@@ -101,6 +101,30 @@ docs/                架构文档（本 README 即 docs/ARCHITECTURE 摘要）
 
 ## Changelog
 
+### beta0.1.5 — 针对现场日志的「IP 跳动 / 接通即断 / 未接管 TCP+UDP」实证修复
+
+**77 项模拟手机自测全部通过（EXIT=0）**，且自测直接抓到并修掉了一次由本轮改动引入的回归。
+
+现场 `linkhelm.log` 的硬证据（不是推测）：
+
+- `捕获 698 → 870 → 960` 在 20s 内持续增长，但 `TCP 活动 0`、`↑61.4KB ↓87.8KB`、`DNS 14`、`UDP 全 0` 全部冻结 → 有包在空转，业务计数为零。
+- `成功 28 / 失败 4`，4 条 `CONNECT reply missing`；大量会话 `↑257B ↓183B 0s`、`↑1.4KB ↓6.2KB 1s` 即结束（TLS 握手未完成），网页 HTML 加载后 JS/CSS/图片全失败。
+- `UDP 就绪 0 握手失败 0 发送 0 回包 0 丢弃 0` → UDP 数据面完全没有证据。
+- `未代理泄漏 0` 是**自证循环**：它只统计 WinDivert 交给引擎的包，无法证明没被捕获的包不存在。
+
+| 根因 | 修复 | 验证 |
+| --- | --- | --- |
+| filter 无 `!impostor`：LAN/IPv6 原样回注的包仍是 outbound，会被同一 handle 再次捕获并再次回注 → 空转占用捕获队列 | 三个 filter 分支全部加 `!impostor`；MainLoop 对 impostor 包只放行一次 | 用 WinDivert 自己的 `EvalFilter` 实测：`0.1.4 filter` 对 impostor 包 = TRUE（循环成立），`0.1.5 filter` = FALSE |
+| listener 回包分支被限定 `outbound`，被栈归类为其它方向的回包从未被改写，应用收到错址包后 RST | 第三条 filter 去掉 `outbound`，全方向捕获 `tcp.SrcPort == local_port` | 构造非 outbound + loopback 的回包，`0.1.5` 命中 / `0.1.4` 漏掉 |
+| SOCKS5 控制连接只有 connect 超时，`HandshakeAuth` 与 CONNECT 回复 `RecvAll` **无超时**；手机接受 TCP 却不回复时永久占住闸门槽位 | `DialWithTimeout` 补 `SO_RCVTIMEO/SO_SNDTIMEO=10s` | `getsockopt` 断言两者均为 10000ms |
+| 24 并发 CONNECT 打爆手机 Kotlin 线程池（`REP=0x05`、`reply missing`），而反射握手已先告诉应用「已连接」 | 闸门并发降到 **8**、等待 8s→20s（排队而非取消）；对 `reply missing/timeout` 类瞬态失败**重试一次**（明确 REP 拒绝不重试） | 闸门 8 槽 + 第 9 个排队 + 释放后放行；手机首次掉线后第二次拨号成功，`connect_retry_ok=1 / socks_ok=1 / live=0` |
+| UDP 是否被接管完全没有计数，LAN 放行的包被静默吞掉 | 新增 `udp_capture / udp_lan_pass / udp_proxy` 分类计数并进入 10s 统计 | 统计行可直接看出 UDP 是「局域网放行」还是「交 ASSOCIATE」 |
+| 引擎无法自证「是否真的全量接管」 | 新增**独立外部审计**：每 10s 用 `GetExtendedTcpTable` 枚举本机所有 ESTABLISHED 公网 TCP 连接（含 PID），与 NAT 表比对，日志输出「已代理 / 未代理」条数及前 3 条未代理明细 | 只读系统表，不修改任何网络配置 |
+
+**真机验收请直接看这两行**：`接管审计`（未代理必须为 0，否则日志会列出具体 IP:端口/PID，那就是 IP 跳动的物理来源）和 `UDP 捕获/局域网/代理` 三个计数。
+
+**边界如实说明**：开发机 `WinDivertOpen` 仍返回 `err=5`（无管理员权限），NETWORK 层真实捕获与回注注入**未在本机实测**；77 项通过覆盖的是驱动上下游的全部产品源码（含用无驱动 helper 验证 filter 语义），不等于「已经能上网」。
+
 ### beta0.1.4 — 按《beta0.1.3 源码诊断与修复方案》一次性修复 F01–F05 及 §4.5/§6/§7
 
 **对照文档逐项落地（60 项模拟手机自测全部通过，EXIT=0）**

@@ -74,6 +74,19 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     }
     nb = 0;
     ioctlsocket(s, FIONBIO, &nb);  // back to blocking for the handshake
+    // beta0.1.5: the SOCKS5 CONTROL plane had no recv/send timeout at all.
+    // DialWithTimeout only bounded connect(); HandshakeAuth() and the
+    // CONNECT reply RecvAll() could block FOREVER when the phone accepted
+    // TCP but never answered (exactly the "CONNECT reply missing" rows in
+    // the field log). Such a worker holds a ConnectGate slot forever, so
+    // later flows are starved and the app sees "connected, then dropped".
+    // Bound every byte of the handshake. Data-plane sockets override this
+    // with their own SO_RCVTIMEO, so this does not change stream behaviour.
+    DWORD tmo = 10000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&tmo), sizeof(tmo));
     return s;
 }
 

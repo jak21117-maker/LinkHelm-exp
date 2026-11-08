@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.1.4 self-test harness.
+// LinkHelm-exp beta0.1.5 self-test harness.
 //
 // This TU #includes the PRODUCTION exp_engine.cpp, so every function under
 // test is the exact same code that ships in LinkHelmExp.exe (no copies, no
@@ -68,6 +68,10 @@ static const uint16_t kPhonePort = 18080;
 static std::atomic<bool> g_phone_on{true};
 // Simulates a loaded phone ProxyServer: ASSOCIATE takes seconds.
 static std::atomic<int> g_assoc_delay_ms{0};
+// beta0.1.5: the phone accepts the TCP connection, then dies before sending
+// the CONNECT reply ("CONNECT reply missing" in the field log). One-shot:
+// the very next CONNECT behaves normally, so the retry can be proven.
+static std::atomic<int> g_transient_drop{0};
 
 // Build a DNS answer over the query (A -> 93.184.216.34, else empty).
 static std::vector<uint8_t> MockDnsAnswer(const uint8_t* q, int n) {
@@ -184,6 +188,13 @@ static void PhoneConn(SOCKET c) {
         return;
     }
     if (cmd != 0x01) { closesocket(c); return; }
+
+    // beta0.1.5 transient-failure hook: drop the connection without any
+    // SOCKS5 reply, so the client sees "CONNECT reply missing".
+    if (g_transient_drop.load() > 0 && g_transient_drop.fetch_sub(1) == 1) {
+        closesocket(c);
+        return;
+    }
 
     // Deterministic F03 pressure-test hook: port 1 is a forced REP=0x05.
     // A real connect() to 127.0.0.1:1 waits for Windows' TCP refusal/retransmit
@@ -335,7 +346,7 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
-    std::printf("=== LinkHelm-exp beta0.1.4 self-test (mock phone) ===\n");
+    std::printf("=== LinkHelm-exp beta0.1.5 self-test (mock phone) ===\n");
     std::printf("sources under test: src/exp_engine.cpp + src/exp_socks5.cpp\n\n");
 
     std::thread(MockPhone).detach();
@@ -775,6 +786,107 @@ int main() {
         Check(!(a < b) && !(b < a) && (a < c), "NAT key {dst_ip,src_port} ordering");
     }
 
+    // ---- 6b. beta0.1.5: control timeout / gate queue / CONNECT retry --
+    {
+        // (1) Without bounded recv/send timeouts, HandshakeAuth() and the
+        // CONNECT reply RecvAll() can block FOREVER when the phone accepts
+        // TCP but never answers ("CONNECT reply missing" in the field log),
+        // holding a gate slot and starving every later flow.
+        std::string e1;
+        SOCKET ctl = ExpSocks5TcpConnect("127.0.0.1", kPhonePort, auth,
+                                         inet_addr("223.5.5.5"), htons(53),
+                                         &e1);
+        Check(ctl != INVALID_SOCKET, "beta0.1.5 control CONNECT succeeds", e1);
+        if (ctl != INVALID_SOCKET) {
+            DWORD rto = 0, sto = 0;
+            int l1 = sizeof(rto), l2 = sizeof(sto);
+            getsockopt(ctl, SOL_SOCKET, SO_RCVTIMEO, (char*)&rto, &l1);
+            getsockopt(ctl, SOL_SOCKET, SO_SNDTIMEO, (char*)&sto, &l2);
+            Check(rto == 10000, "control SO_RCVTIMEO=10s (no infinite stall)",
+                  std::to_string(rto));
+            Check(sto == 10000, "control SO_SNDTIMEO=10s",
+                  std::to_string(sto));
+            closesocket(ctl);
+        }
+
+        // (2) Gate is 8 concurrent handshakes; the 9th QUEUES instead of
+        // adding a 25th CONNECT to an already saturated phone.
+        static ConnectGate gq;
+        static std::atomic<bool> gq_alive{true};
+        int acquired = 0;
+        for (int i = 0; i < 8; ++i)
+            if (gq.Acquire(&gq_alive, 100)) ++acquired;
+        Check(acquired == 8, "gate allows exactly 8 concurrent CONNECTs",
+              std::to_string(acquired));
+        Check(!gq.Acquire(&gq_alive, 60),
+              "9th handshake QUEUES (never dials a saturated phone)");
+        std::atomic<bool> got{false};
+        std::thread waiter([&gq, &got] {
+            got.store(gq.Acquire(&gq_alive, 3000));
+        });
+        Sleep(80);
+        Check(!got.load(), "waiter stays queued while the gate is full");
+        gq.Release();
+        waiter.join();
+        Check(got.load(), "queued handshake proceeds once a slot frees");
+        for (int i = 0; i < 8; ++i) gq.Release();
+
+        // (3) One transient "CONNECT reply missing" must be retried and
+        // recovered, then finalized exactly once.
+        g_transient_drop.store(1);
+        auto st3 = std::make_shared<EngineStats>();
+        static TcpRegistry reg3;
+        static ConnectGate gate3;
+        static std::atomic<bool> stop3{true};
+        static std::atomic<int> budget3{0};
+        SOCKET ln3 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in la3{};
+        la3.sin_family = AF_INET;
+        la3.sin_addr.s_addr = inet_addr("127.0.0.1");
+        la3.sin_port = 0;
+        bind(ln3, (sockaddr*)&la3, sizeof(la3));
+        listen(ln3, 4);
+        sockaddr_in got3{}; int gl3 = sizeof(got3);
+        getsockname(ln3, (sockaddr*)&got3, &gl3);
+        SOCKET app3 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        connect(app3, (sockaddr*)&got3, sizeof(got3));
+        SOCKET acc3 = accept(ln3, nullptr, nullptr);
+        Check(acc3 != INVALID_SOCKET, "retry-test reflection socket pair");
+        if (acc3 != INVALID_SOCKET) {
+            auto sess3 = std::make_shared<TcpSession>();
+            sess3->client.store(acc3);
+            sess3->budget = &budget3;
+            budget3.fetch_add(1);
+            {
+                std::lock_guard<std::mutex> lk(reg3.mtx);
+                reg3.live.push_back(sess3);
+            }
+            NatEntry ne3{};
+            ne3.orig_dst_ip = ntohl(inet_addr("223.5.5.5"));
+            ne3.orig_dst_port = 53;
+            ne3.app_ip = inet_addr("127.0.0.1");
+            ne3.flow_id = 777;
+            std::thread(TcpWorker, sess3, ne3, std::string("127.0.0.1"),
+                        kPhonePort, auth, (uint64_t)777, logfn, &reg3, st3,
+                        &gate3, &stop3, &budget3).detach();
+            for (int i = 0; i < 100 &&
+                 st3->socks_ok.load() == 0 && st3->socks_fail.load() == 0;
+                 ++i) Sleep(50);
+            Check(st3->connect_retry.load() == 1,
+                  "transient CONNECT failure triggers one retry",
+                  std::to_string(st3->connect_retry.load()));
+            Check(st3->connect_retry_ok.load() == 1 &&
+                      st3->socks_ok.load() == 1,
+                  "retry recovers the session (phone answers 2nd dial)");
+            closesocket(app3);
+            for (int i = 0; i < 100 && budget3.load() > 0; ++i) Sleep(50);
+            Check(budget3.load() == 0 && reg3.live.empty(),
+                  "retry path finalizes exactly once (live=0, budget=0)");
+        }
+        closesocket(ln3);
+        g_transient_drop.store(0);
+    }
+
     // ---- 7. WinDivert filter compile + packet evaluation --------------
     // These helpers live in WinDivert.dll and do NOT need the driver or
     // elevation. They prove the filter is syntactically valid and that IPv6
@@ -799,20 +911,31 @@ int main() {
 
             // Exactly the expression assembled in ExpEngine::Start (example
             // values substituted for the runtime phone IP and listener port).
+            // beta0.1.5 adds !impostor to every branch and drops the
+            // `outbound` restriction on the listener-return branch.
             std::string nf =
+                "(outbound and !loopback and !impostor and "
+                "ip.DstAddr != 192.168.49.1 and (tcp or udp)) "
+                "or (outbound and !loopback and !impostor and ipv6) "
+                "or (tcp.SrcPort == 7712 and !impostor)";
+            std::string of =   // beta0.1.4
                 "outbound and !loopback and ip.DstAddr != 192.168.49.1 "
                 "and (tcp or udp) or (outbound and !loopback and ipv6) "
                 "or (outbound and tcp.SrcPort == 7712)";
-            std::string of =
+            std::string of2 =  // beta0.1.2 (no IPv6 branch at all)
                 "outbound and !loopback and ip.DstAddr != 192.168.49.1 "
                 "and (tcp or udp) or (outbound and tcp.SrcPort == 7712)";
             if (compile) {
                 const char* es = nullptr; UINT pos = 0;
                 BOOL c = compile(nf.c_str(), WINDIVERT_LAYER_NETWORK,
                                  nullptr, 0, &es, &pos);
-                Check(c == TRUE, "beta0.1.3 filter (with IPv6) compiles",
+                Check(c == TRUE, "beta0.1.5 filter (!impostor) compiles",
                       c ? "OK" : std::string(es ? es : "?") + "@" +
                                     std::to_string(pos));
+                Check(compile("outbound and !impostor and (tcp or udp)",
+                              WINDIVERT_LAYER_NETWORK, nullptr, 0, &es,
+                              &pos) == TRUE,
+                      "impostor is a legal WinDivert filter token");
             }
             if (eval) {
                 WINDIVERT_ADDRESS ad{};
@@ -840,9 +963,13 @@ int main() {
                                 eval(f, v6, sizeof(v6), &ad6) == TRUE
                                     ? "TRUE" : "FALSE");
                 bool n6 = eval(nf.c_str(), v6, sizeof(v6), &ad6) == TRUE;
-                bool o6 = eval(of.c_str(), v6, sizeof(v6), &ad6) == TRUE;
-                Check(n6, "new filter CAPTURES global IPv6 egress");
-                Check(!o6, "old filter MISSED IPv6 (confirms leak root cause)");
+                bool o6 = eval(of2.c_str(), v6, sizeof(v6), &ad6) == TRUE;
+                Check(n6, "beta0.1.5 filter CAPTURES global IPv6 egress");
+                Check(!o6, "beta0.1.2 filter MISSED IPv6 (historical leak)");
+                WINDIVERT_ADDRESS ad6i = ad6;
+                ad6i.Impostor = 1;
+                Check(eval(nf.c_str(), v6, sizeof(v6), &ad6i) != TRUE,
+                      "injected IPv6 packet is NOT re-captured (loop guard)");
 
                 // IPv4 + TCP SYN to a public host
                 uint8_t v4[40] = {0};
@@ -852,7 +979,50 @@ int main() {
                 v4[20] = 0xC3; v4[21] = 0x50; v4[22] = 0x01; v4[23] = 0xbb;
                 v4[32] = 0x50; v4[33] = 0x02;
                 Check(eval(nf.c_str(), v4, sizeof(v4), &ad) == TRUE,
-                      "new filter CAPTURES public IPv4 TCP");
+                      "beta0.1.5 filter CAPTURES public IPv4 TCP");
+
+                // DECISIVE beta0.1.5 evidence: a LAN/IPv6 packet that we
+                // reinject UNCHANGED has Impostor=1. 0.1.4's filter matched
+                // it again, so the same packet was captured -> reinjected ->
+                // captured forever (field log: recv_ok 698->870->960 while
+                // every business counter stayed frozen). The new filter
+                // must exclude it.
+                WINDIVERT_ADDRESS ad_imp = ad;
+                ad_imp.Impostor = 1;
+                Check(eval(nf.c_str(), v4, sizeof(v4), &ad_imp) != TRUE,
+                      "beta0.1.5 EXCLUDES reinjected packet (no capture loop)");
+                Check(eval(of.c_str(), v4, sizeof(v4), &ad_imp) == TRUE,
+                      "beta0.1.4 RE-CAPTURED reinjected packet (loop root cause)");
+
+                // Listener return packets were restricted to `outbound` in
+                // 0.1.4. A reply classified inbound/loopback was never
+                // rewritten -> the app got a packet addressed to the local
+                // listener port and reset the flow. 0.1.5 captures it in
+                // ALL directions.
+                uint8_t reply[40] = {0};
+                reply[0] = 0x45; reply[3] = 40; reply[9] = 6;
+                reply[12] = 192; reply[13] = 168; reply[14] = 49;
+                reply[15] = 74;
+                reply[16] = 8; reply[17] = 8; reply[18] = 8; reply[19] = 8;
+                reply[20] = 0x1E; reply[21] = 0x20;  // SrcPort 7712
+                reply[22] = 0xC3; reply[23] = 0x50;
+                // A valid TCP header needs DataOffset=5 (>=20 bytes) or
+                // WinDivert's parser refuses to expose tcp.* fields at all.
+                reply[32] = 0x50; reply[33] = 0x10;  // 5 words, ACK
+                WINDIVERT_ADDRESS ad_ret{};
+                ad_ret.Outbound = 0;      // stack classified it otherwise
+                ad_ret.Loopback = 1;
+                const char* rp[] = {"tcp", "tcp.SrcPort == 7712", "!impostor",
+                                    "tcp.SrcPort == 7712 and !impostor",
+                                    "loopback", "inbound"};
+                for (auto* f : rp)
+                    std::printf("[reply-probe] %-42s = %s\n", f,
+                                eval(f, reply, sizeof(reply), &ad_ret) == TRUE
+                                    ? "TRUE" : "FALSE");
+                Check(eval(nf.c_str(), reply, sizeof(reply), &ad_ret) == TRUE,
+                      "beta0.1.5 CAPTURES listener reply in any direction");
+                Check(eval(of.c_str(), reply, sizeof(reply), &ad_ret) != TRUE,
+                      "beta0.1.4 MISSED non-outbound listener reply");
 
                 // IPv4 to the phone SOCKS5 endpoint must NOT be captured
                 v4[16] = 192; v4[17] = 168; v4[18] = 49; v4[19] = 1;
