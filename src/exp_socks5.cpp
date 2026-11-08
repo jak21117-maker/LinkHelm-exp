@@ -145,10 +145,14 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     // beta0.1.8 (report §04): the field log's worst line was
     //   "CONNECT reply missing, 18552ms" = 3 attempts x 6s.
     // That flow occupied one ConnectGate slot for 18.5 SECONDS; with cap 2
-    // two such flows starved the whole engine. The measured healthy dial is
-    // 45-112ms, so 4s per attempt is 35x the observed worst case and still
-    // tolerates a slow cellular uplink. 2 attempts x 4s = 8s worst case.
-    DWORD tmo = 4000;
+    // two such flows starved the whole engine. The gate is gone in 0.2.x,
+    // so a slow dial now costs only its own thread.
+    // beta0.2.1: 4000 -> 6000. Field beta0.2.0: SUCCESSFUL connects reached
+    // p95 3123ms under load (p50 70ms) — the phone is simply slower than 4s
+    // sometimes, and every one of the 21 failures died at exactly 4000ms.
+    // 6s covers the observed distribution; a truly dead target still fails
+    // in bounded time (6s, +6s on the single transient retry).
+    DWORD tmo = 6000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&tmo), sizeof(tmo));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,

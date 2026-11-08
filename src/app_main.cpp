@@ -6,7 +6,7 @@
 // result to the window; the tray is a plain Shell_NotifyIcon that cannot be
 // "missing from the build".
 //
-// LinkHelm-exp beta0.2.0 — experimental transparent data plane.
+// LinkHelm-exp beta0.2.1 — experimental transparent data plane.
 // The store-boost page is REMOVED; pages: Connect (WinDivert+SOCKS5 engine,
 // ICS sharing) and Share/Transfer (file transfer assistant). No Wintun, no
 // lwIP, no virtual adapter: the phone's SOCKS5 host is reached directly over
@@ -1196,7 +1196,7 @@ void RefreshEthList() {
 }
 
 // ---- connect/disconnect workers (LinkHelm-exp engine) ----
-// beta0.2.0: the engine replaces TunnelManager (lwIP + wintun are GONE).
+// beta0.2.1: the engine replaces TunnelManager (lwIP + wintun are GONE).
 // The 1.1.x reconnect governor below is kept verbatim from 1.1.3 — only
 // the connect/stop primitives underneath were swapped to the engine.
 
@@ -1267,7 +1267,7 @@ static bool TryConnectOnce(const linkhelm::ExpConfig& cfg,
 // is retried at most 10 consecutive times; the 10th failure performs a
 // full disconnect, resets the UI and stops retrying. Success clears the
 // counter. User Disconnect / app quit sets abort_reconnect and wins.
-// (beta0.2.0: drives the WinDivert+SOCKS5 engine instead of the tunnel.)
+// (beta0.2.1: drives the WinDivert+SOCKS5 engine instead of the tunnel.)
 static void ConnectWithRetry(linkhelm::ExpConfig cfg) {
     if (g_app.reconnect_busy.exchange(true)) return;
     g_app.abort_reconnect.store(false);
@@ -1836,7 +1836,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         // only, which is the phone's SECOND resolver: a flaky
                         // 223 made the whole UDP data plane look dead even
                         // though 119 answered fine.
-                        // beta0.2.0: no TUN bind — when the engine runs the
+                        // beta0.2.1: no TUN bind — when the engine runs the
                         // probe is captured by WinDivert and relayed via the
                         // phone's SOCKS5 UDP ASSOCIATE, so it doubles as an
                         // end-to-end UDP data plane test.
@@ -2027,7 +2027,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MessageBoxW(hwnd,
                         g_lang_zh
                             ? L"【产品说明】\n"
-                              L"LinkHelm-exp beta0.2.0（实验版）。无虚拟网卡透明上网："
+                              L"LinkHelm-exp beta0.2.1（实验版）。无虚拟网卡透明上网："
                               L"WinDivert 拦截本机流量，经 Wi-Fi Direct 直连手机上的 "
                               L"SOCKS5 出口（TCP CONNECT + UDP ASSOCIATE，RFC 1929 "
                               L"用户名/密码认证）。不含商店加速；连接、共享(ICS)、"
@@ -2048,7 +2048,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               L"仅供个人学习与合法用途。使用者应遵守所在地法律法规，"
                               L"不得用于任何违法用途。软件按『现状』提供，不附带任何担保。"
                             : L"[Product]\n"
-                              L"LinkHelm-exp beta0.2.0 (experimental). Transparent "
+                              L"LinkHelm-exp beta0.2.1 (experimental). Transparent "
                               L"networking WITHOUT a virtual adapter: WinDivert "
                               L"captures host traffic and forwards it to the "
                               L"SOCKS5 host on your phone over Wi-Fi Direct "
@@ -2317,7 +2317,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     // capture handle AND the half-routes — a direct cause of "capture dead"
     // and "route verify failed" in the field. Checked AFTER lang.txt is read
     // so the notice follows the UI language.
-    // beta0.2.0: DIFFERENT mutex name from the mainline desktop app — the
+    // beta0.2.1: DIFFERENT mutex name from the mainline desktop app — the
     // user may legitimately run LinkHelm 1.1.3 (wintun line) and this exp
     // build side by side; sharing one singleton made each block the other.
     const wchar_t* kSingleMutex = L"Local\\LinkHelmExpSingleton";
@@ -2345,7 +2345,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
         if (single) CloseHandle(single);
         return 0;
     }
-    // LinkHelm-exp beta0.2.0: no TUN adapter / lwIP engine / pinned default
+    // LinkHelm-exp beta0.2.1: no TUN adapter / lwIP engine / pinned default
     // route / child engine process to clean up at startup. The WinDivert
     // filters die with the process (kernel closes the handle), and the
     // engine removes its half-routes on Stop. A hard-killed session can
@@ -2392,8 +2392,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     RegisterClassW(&swc);
 
     HWND hwnd = CreateWindowExW(0, kClass,
-        TR(L"LinkHelm-exp beta0.2.0 (WinDivert, no virtual adapter)",
-           L"LinkHelm-exp beta0.2.0（WinDivert 无虚拟网卡实验版）"),
+        TR(L"LinkHelm-exp beta0.2.1 (WinDivert, no virtual adapter)",
+           L"LinkHelm-exp beta0.2.1（WinDivert 无虚拟网卡实验版）"),
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                     WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, kWidth, kHeight,

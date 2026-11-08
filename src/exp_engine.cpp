@@ -444,9 +444,17 @@ struct EngineStats {
     std::atomic<uint64_t> inject_attempt{0};
     std::atomic<uint64_t> inject_ok{0};
     std::atomic<uint64_t> inject_fail{0};
-    // beta0.2.0: gate counters (gate_timeout / gate_engine_stop /
-    // connect_retry) are GONE with the gate — ProxyBridge has no local
-    // queue to cancel from and no retry layer of its own.
+    // beta0.2.0: gate counters (gate_timeout / gate_engine_stop) are GONE
+    // with the gate — ProxyBridge has no local queue to cancel from.
+    // beta0.2.1: ONE bounded retry for transient CONNECT failures (phone
+    // did not answer in the window). Field beta0.2.0: 21 failures, all
+    // CONNECT_REPLY_MISSING at ~4000ms, while successes reached p95 3123ms
+    // — the phone was still working, just slower than the old 4s cutoff.
+    std::atomic<uint64_t> connect_retry{0};
+    std::atomic<uint64_t> connect_retry_ok{0};
+    // beta0.2.1 DNS positive cache + serve-stale (see DnsCache).
+    std::atomic<uint64_t> dns_cache_hit{0};
+    std::atomic<uint64_t> dns_stale_served{0};
     // beta0.1.5: prove UDP is actually taken over. The old stats were all
     // zero because every UDP datagram that reached the LAN-bypass branch
     // was silently reinjected and counted nowhere.
@@ -713,6 +721,137 @@ bool RecvAllRaw(SOCKET s, uint8_t* buf, int len) {
     return true;
 }
 
+// ---- DNS positive cache + serve-stale (beta0.2.1) -------------------------
+// Field beta0.2.0: DNS 成功 94 失败 0 yet the user saw "Internet 一会儿有一会儿
+// 没有". Every query paid a full SOCKS5 TCP dial + exchange (~50-300ms), and
+// any phone-side stall made ALL lookups fail simultaneously. A small positive
+// cache (TTL clamped to 30..300s) plus a 5-minute serve-stale window on
+// upstream failure keeps pages resolving across those hiccups.
+struct DnsCacheEntry {
+    std::vector<uint8_t> reply;  // stored as sent; ID patched at serve time
+    int64_t fetched_ms = 0;      // steady_clock epoch ms
+    int64_t ttl_ms = 0;
+};
+
+struct DnsCache {
+    std::mutex mtx;
+    std::map<std::string, DnsCacheEntry> map;
+};
+
+static int64_t DnsCacheNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Skip a (possibly compressed) domain name starting at off. Returns the
+// offset AFTER the name, or -1 on malformed input. Compression pointers are
+// skipped as 2 bytes, never followed (answers only ever shrink the walk).
+static int DnsSkipName(const uint8_t* d, size_t len, int off) {
+    int guard = 0;
+    while (off < (int)len) {
+        uint8_t l = d[off];
+        if (l == 0) return off + 1;
+        if ((l & 0xC0) == 0xC0) {
+            if (off + 1 >= (int)len) return -1;
+            return off + 2;
+        }
+        off += 1 + l;
+        if (++guard > 128) return -1;
+    }
+    return -1;
+}
+
+// Cache key: lowercased QNAME (raw label bytes) + '|' + QTYPE. "" if the
+// query is malformed.
+static std::string DnsCacheKey(const std::vector<uint8_t>& q) {
+    if (q.size() < 12) return "";
+    int off = DnsSkipName(q.data(), q.size(), 12);
+    if (off < 0 || off + 4 > (int)q.size()) return "";
+    uint16_t qtype = (uint16_t)((q[off] << 8) | q[off + 1]);
+    std::string key;
+    key.reserve((size_t)(off - 12) + 8);
+    for (int i = 12; i < off; ++i)
+        key.push_back((char)std::tolower(q[i]));
+    key += '|';
+    key += std::to_string(qtype);
+    return key;
+}
+
+// Minimum TTL across the answer records, clamped to [30s, 300s]. -1 when the
+// message is malformed, non-zero RCODE, or has no positive answers (never
+// cache negative replies).
+static int64_t DnsReplyMinTtlMs(const std::vector<uint8_t>& r) {
+    if (r.size() < 12) return -1;
+    uint16_t flags = (uint16_t)((r[2] << 8) | r[3]);
+    if ((flags & 0x000F) != 0) return -1;
+    uint16_t an = (uint16_t)((r[6] << 8) | r[7]);
+    if (an == 0) return -1;
+    int off = 12;
+    int qd = (uint16_t)((r[4] << 8) | r[5]);
+    for (int i = 0; i < qd; ++i) {  // skip the question section
+        int o = DnsSkipName(r.data(), r.size(), off);
+        if (o < 0 || o + 4 > (int)r.size()) return -1;
+        off = o + 4;
+    }
+    int64_t min_ttl = -1;
+    for (int i = 0; i < an && off + 10 <= (int)r.size(); ++i) {
+        int o = DnsSkipName(r.data(), r.size(), off);
+        if (o < 0 || o + 10 > (int)r.size()) return -1;
+        uint32_t ttl = ((uint32_t)r[o + 4] << 24) | ((uint32_t)r[o + 5] << 16) |
+                       ((uint32_t)r[o + 6] << 8) | (uint32_t)r[o + 7];
+        uint16_t rdlen = (uint16_t)((r[o + 8] << 8) | r[o + 9]);
+        off = o + 10 + rdlen;
+        if (off > (int)r.size()) return -1;
+        int64_t t = (int64_t)ttl * 1000;
+        if (min_ttl < 0 || t < min_ttl) min_ttl = t;
+    }
+    if (min_ttl < 0) return -1;
+    if (min_ttl < 30000) min_ttl = 30000;
+    if (min_ttl > 300000) min_ttl = 300000;
+    return min_ttl;
+}
+
+static void DnsCacheStore(DnsCache* c, const std::vector<uint8_t>& q,
+                          const std::vector<uint8_t>& reply) {
+    std::string key = DnsCacheKey(q);
+    if (key.empty()) return;
+    int64_t ttl = DnsReplyMinTtlMs(reply);
+    if (ttl <= 0) return;
+    DnsCacheEntry e;
+    e.reply = reply;
+    e.fetched_ms = DnsCacheNowMs();
+    e.ttl_ms = ttl;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (c->map.size() > 512) c->map.clear();  // crude bound; entries are tiny
+    c->map[key] = std::move(e);
+}
+
+// Fresh hit: age < TTL (always served). Stale hit: age < TTL + 300s (only
+// used as a last resort when the upstream is unreachable). The transaction
+// ID is patched to the NEW query's ID — stub resolvers match on it.
+static bool DnsCacheLookup(DnsCache* c, const std::vector<uint8_t>& q,
+                           std::vector<uint8_t>* reply_out, bool* stale_out) {
+    *stale_out = false;
+    std::string key = DnsCacheKey(q);
+    if (key.empty()) return false;
+    int64_t now = DnsCacheNowMs();
+    std::lock_guard<std::mutex> lk(c->mtx);
+    auto it = c->map.find(key);
+    if (it == c->map.end()) return false;
+    int64_t age = now - it->second.fetched_ms;
+    if (age < 0) age = 0;
+    bool fresh = age < it->second.ttl_ms;
+    bool stale = age < it->second.ttl_ms + 300000;
+    if (!fresh && !stale) return false;
+    *stale_out = !fresh;
+    *reply_out = it->second.reply;
+    if (reply_out->size() >= 2 && q.size() >= 2) {
+        (*reply_out)[0] = q[0];
+        (*reply_out)[1] = q[1];
+    }
+    return true;
+}
+
 struct DnsProxy {
     SOCKET sock = INVALID_SOCKET;
     std::atomic<bool> running{false};
@@ -724,6 +863,9 @@ struct DnsProxy {
     std::string fallback = "8.8.8.8";
     // exp_policy.ini Aaaa=allow disables suppression for compatibility tests.
     std::atomic<bool> aaaa_suppress{true};
+    // beta0.2.1: positive cache — most lookups never leave the PC, and a
+    // phone-side hiccup no longer makes every resolution fail at once.
+    DnsCache cache;
 };
 
 void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
@@ -733,6 +875,20 @@ void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
     p->budget.fetch_add(1);
     bool ok = false;
     if (query.size() >= 12 && query.size() <= 4096) {
+        // beta0.2.1: fresh cache hit answers without touching the phone.
+        {
+            std::vector<uint8_t> creply;
+            bool stale = false;
+            if (DnsCacheLookup(&p->cache, query, &creply, &stale) && !stale) {
+                sendto(p->sock, reinterpret_cast<const char*>(creply.data()),
+                       (int)creply.size(), 0,
+                       reinterpret_cast<sockaddr*>(&client), sizeof(client));
+                stats->dns_ok.fetch_add(1);
+                stats->dns_cache_hit.fetch_add(1);
+                p->budget.fetch_sub(1);
+                return;
+            }
+        }
         // TCP DNS (RFC 7766): 2-byte length prefix, then the message
         std::vector<uint8_t> req(2 + query.size());
         req[0] = static_cast<uint8_t>(query.size() >> 8);
@@ -806,7 +962,22 @@ void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
                            reinterpret_cast<sockaddr*>(&client),
                            sizeof(client));
             ok = (n == (int)reply.size());
+            if (ok) DnsCacheStore(&p->cache, query, reply);
             // a local sendto failure is NOT a link failure: do not redial
+        }
+        // beta0.2.1 serve-stale: both upstream attempts failed (phone link
+        // hiccup) — a cached answer no older than TTL+5min is far better
+        // than NXDOMAIN-by-silence for every app on the machine.
+        if (!ok) {
+            std::vector<uint8_t> creply;
+            bool stale = false;
+            if (DnsCacheLookup(&p->cache, query, &creply, &stale) && stale) {
+                sendto(p->sock, reinterpret_cast<const char*>(creply.data()),
+                       (int)creply.size(), 0,
+                       reinterpret_cast<sockaddr*>(&client), sizeof(client));
+                ok = true;
+                stats->dns_stale_served.fetch_add(1);
+            }
         }
     }
     if (ok) stats->dns_ok.fetch_add(1);
@@ -1008,14 +1179,45 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     // a new SYN starts a fresh flow. Failure = immediate RST to the app
     // (ProxyBridge reset_close), so the app errors NOW and retries on its
     // own schedule instead of waiting out its 5s business timeout.
+    //
+    // beta0.2.1: ONE bounded retry for TRANSIENT failures only (the phone
+    // did not answer CONNECT within the window). Field beta0.2.0: 21
+    // failures, every one CONNECT_REPLY_MISSING at ~4000ms, while successes
+    // reached p95 3123ms — the phone was still working, just slower than
+    // the cutoff, and games (小黑盒) treat a dead connect as a session
+    // failure. An explicit refusal (CONNECT_REJECTED / refused TCP) is the
+    // phone's FINAL answer and is NOT retried. There is no gate any more,
+    // so a retry costs only its own thread — nothing else queues behind it.
     auto t0 = std::chrono::steady_clock::now();
     std::string err;
     ExpSocks5Timing tm{};
     uint32_t local_ip = 0;
-    SOCKET r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
-                                   htonl(entry.orig_dst_ip),
-                                   htons(entry.orig_dst_port), &err, &tm,
-                                   &local_ip);
+    SOCKET r = INVALID_SOCKET;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!stop->load()) break;
+        err.clear();
+        tm = ExpSocks5Timing{};
+        r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
+                                htonl(entry.orig_dst_ip),
+                                htons(entry.orig_dst_port), &err, &tm,
+                                &local_ip);
+        if (r != INVALID_SOCKET) {
+            if (attempt > 0) {
+                stats->connect_retry_ok.fetch_add(1);
+                log(L"[exp] #" + std::to_wstring(flow_id) +
+                    L" CONNECT 重试成功 → " + dstw);
+            }
+            break;
+        }
+        if (attempt == 0) {
+            stats->connect_retry.fetch_add(1);
+            bool transient =
+                err.find("CONNECT_REPLY_MISSING") != std::string::npos ||
+                err.find("SELECT_TIMEOUT") != std::string::npos;
+            if (!transient) break;   // refusal / send failure: final
+            Sleep(500);
+        }
+    }
     int dial_ms = static_cast<int>(std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
         .count());
@@ -1756,6 +1958,8 @@ void ExpEngine::Impl::ExpireLoop() {
                 std::to_wstring(tcp_budget.load()) +
                 L" | 成功 " + std::to_wstring(stats->socks_ok.load()) +
                 L" 失败 " + std::to_wstring(stats->socks_fail.load()) +
+                L" 重试 " + std::to_wstring(stats->connect_retry.load()) +
+                L" 重试成功 " + std::to_wstring(stats->connect_retry_ok.load()) +
                 L" | ↑" + HUMAN_BYTES(stats->bytes_up.load()) +
                 L" ↓" + HUMAN_BYTES(stats->bytes_down.load()) +
                 L" | 捕获 " + std::to_wstring(stats->recv_ok.load()) +
@@ -1776,6 +1980,8 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" | DNS 池复用失败 " +
                 std::to_wstring(stats->dns_pool_reuse_fail.load()) +
                 L" 重拨成功 " + std::to_wstring(stats->dns_pool_redial_ok.load()) +
+                L" 缓存命中 " + std::to_wstring(stats->dns_cache_hit.load()) +
+                L" 过期回源 " + std::to_wstring(stats->dns_stale_served.load()) +
                 L" | IPv6 阻断 " + std::to_wstring(stats->ipv6_drop.load()) +
                 L" | UDP 捕获 " + std::to_wstring(stats->udp_capture.load()) +
                 L" 局域网 " + std::to_wstring(stats->udp_lan_pass.load()) +

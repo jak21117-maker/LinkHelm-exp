@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.2.0 — MINIMAL end-to-end self-test.
+// LinkHelm-exp beta0.2.1 — MINIMAL end-to-end self-test.
 //
 // Design rule (per review): no pure-function / mock / self-attesting asserts.
 // Every Check() below crosses a REAL socket boundary against an in-process
@@ -467,7 +467,7 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.2.0 end-to-end self-test ===\n");
+    std::printf("=== LinkHelm-exp beta0.2.1 end-to-end self-test ===\n");
     std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
                 "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 
@@ -688,7 +688,7 @@ int main(int argc, char** argv) {
                           std::to_string(excl_imp) + " phone=" +
                           std::to_string(excl_phone));
 
-                // beta0.2.0 (§06): DNS to the PHONE must be captured so the
+                // beta0.2.1 (§06): DNS to the PHONE must be captured so the
                 // "WinDivert intercepts DNS" fallback is reachable. The old
                 // filter excluded the whole phone IP, which made that
                 // fallback unreachable by construction -> NCSI flickered.
@@ -709,7 +709,7 @@ int main(int argc, char** argv) {
                       "phone_dns=" + std::to_string(cap_phone_dns) +
                           " phone_socks=" + std::to_string(excl_phone_socks));
 
-                // beta0.2.0 (§05): a PUBLIC service on port 8080 must be
+                // beta0.2.1 (§05): a PUBLIC service on port 8080 must be
                 // captured. The old code bypassed ANY port-8080 traffic
                 // (including public :8080), which sent it out through the
                 // native route — an unproxied egress, i.e. "public IP
@@ -725,7 +725,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 9. beta0.2.0: the ConnectGate is GONE (ProxyBridge architecture — no
+    // 9. beta0.2.1: the ConnectGate is GONE (ProxyBridge architecture — no
     //    local admission queue). Its policy assertions died with it; the
     //    failure path is covered by test 10 (refusal classification) and
     //    the RST-on-failure behaviour of TcpWorker itself.
@@ -766,6 +766,46 @@ int main(int argc, char** argv) {
                       std::to_string(hs == hr) + " " + std::to_string(ms) +
                       "ms");
         }
+    }
+
+    // 12. DNS positive cache (beta0.2.1): a stored reply is served fresh
+    //     with the NEW query's transaction ID, negative replies (RCODE!=0)
+    //     are never cached, and malformed queries are ignored safely.
+    {
+        DnsCache c;
+        // query: example.com A, ID 0x1111
+        std::vector<uint8_t> q = {0x11,0x11, 0x01,0x00, 0,1, 0,0, 0,0, 0,0,
+                                  7,'e','x','a','m','p','l','e',
+                                  3,'c','o','m', 0, 0,1, 0,1};
+        // reply: NOERROR, 1 A answer, TTL 120s, ID 0x2222 (as received)
+        std::vector<uint8_t> r = {0x22,0x22, 0x81,0x80, 0,1, 0,1, 0,0, 0,0,
+                                  7,'e','x','a','m','p','l','e',
+                                  3,'c','o','m', 0, 0,1, 0,1,
+                                  0xC0,0x0C, 0,1, 0,1, 0,0,0,120, 0,4,
+                                  1,2,3,4};
+        DnsCacheStore(&c, q, r);
+        // second query: same name/type, different ID
+        std::vector<uint8_t> q2 = q;
+        q2[0] = 0xAB; q2[1] = 0xCD;
+        std::vector<uint8_t> out; bool stale = false;
+        bool hit = DnsCacheLookup(&c, q2, &out, &stale);
+        Check(hit && !stale && out.size() == r.size() && out[0] == 0xAB &&
+                  out[1] == 0xCD && out[41] == 1 && out[42] == 2 &&
+                  out[43] == 3 && out[44] == 4,
+              "DNS cache: fresh hit serves with the new transaction ID",
+              "hit=" + std::to_string(hit) + " stale=" +
+                  std::to_string(stale) + " size=" +
+                  std::to_string(out.size()));
+        // negative reply (NXDOMAIN, an=0) must NOT be cached
+        DnsCache c2;
+        std::vector<uint8_t> neg = {0x33,0x33, 0x81,0x83, 0,1, 0,0, 0,0, 0,0,
+                                    7,'e','x','a','m','p','l','e',
+                                    3,'c','o','m', 0, 0,1, 0,1};
+        DnsCacheStore(&c2, q, neg);
+        std::vector<uint8_t> out2; bool stale2 = false;
+        bool hit2 = DnsCacheLookup(&c2, q, &out2, &stale2);
+        Check(!hit2, "DNS cache: negative (RCODE!=0) replies are never cached",
+              "unexpected_hit=" + std::to_string(hit2));
     }
 
     std::printf("\n=== RESULT: %d passed, %d failed ===\n",
