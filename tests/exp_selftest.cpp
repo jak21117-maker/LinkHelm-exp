@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.1.9 — MINIMAL end-to-end self-test.
+// LinkHelm-exp beta0.2.0 — MINIMAL end-to-end self-test.
 //
 // Design rule (per review): no pure-function / mock / self-attesting asserts.
 // Every Check() below crosses a REAL socket boundary against an in-process
@@ -325,7 +325,6 @@ static std::string RunSession(uint16_t dst_port, uint32_t dst_ip,
         sess->client.store(accepted);
         static std::atomic<int> budget{0};
         static TcpRegistry reg;
-        static ConnectGate gate;
         static std::atomic<bool> stop_flag{true};
         static auto stats = std::make_shared<EngineStats>();
         static auto logfn = [](const std::wstring&) {};
@@ -342,7 +341,7 @@ static std::string RunSession(uint16_t dst_port, uint32_t dst_ip,
         ne.flow_id = 77;
         std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
                     kPhonePort, auth, (uint64_t)77, logfn, &reg, stats,
-                    &gate, &stop_flag, &budget).detach();
+                    &stop_flag, &budget).detach();
         const char* req = "GET / HTTP/1.0\r\nHost: www.baidu.com\r\n"
                           "Connection: close\r\n\r\n";
         SendAllT(app, req, (int)strlen(req));
@@ -386,7 +385,6 @@ static bool RunBulkLoopback(size_t total, const ExpAuth& auth,
         sess->client.store(accepted);
         static std::atomic<int> bulk_budget{0};
         static TcpRegistry bulk_reg;
-        static ConnectGate bulk_gate;
         static std::atomic<bool> bulk_stop{true};
         static auto bulk_stats = std::make_shared<EngineStats>();
         static auto bulk_log = [](const std::wstring&) {};
@@ -403,7 +401,7 @@ static bool RunBulkLoopback(size_t total, const ExpAuth& auth,
         ne.flow_id = 78;
         std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
                     kPhonePort, auth, (uint64_t)78, bulk_log,
-                    &bulk_reg, bulk_stats, &bulk_gate, &bulk_stop,
+                    &bulk_reg, bulk_stats, &bulk_stop,
                     &bulk_budget).detach();
 
         auto t0 = std::chrono::steady_clock::now();
@@ -469,7 +467,7 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.1.9 end-to-end self-test ===\n");
+    std::printf("=== LinkHelm-exp beta0.2.0 end-to-end self-test ===\n");
     std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
                 "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 
@@ -690,7 +688,7 @@ int main(int argc, char** argv) {
                           std::to_string(excl_imp) + " phone=" +
                           std::to_string(excl_phone));
 
-                // beta0.1.9 (§06): DNS to the PHONE must be captured so the
+                // beta0.2.0 (§06): DNS to the PHONE must be captured so the
                 // "WinDivert intercepts DNS" fallback is reachable. The old
                 // filter excluded the whole phone IP, which made that
                 // fallback unreachable by construction -> NCSI flickered.
@@ -711,7 +709,7 @@ int main(int argc, char** argv) {
                       "phone_dns=" + std::to_string(cap_phone_dns) +
                           " phone_socks=" + std::to_string(excl_phone_socks));
 
-                // beta0.1.9 (§05): a PUBLIC service on port 8080 must be
+                // beta0.2.0 (§05): a PUBLIC service on port 8080 must be
                 // captured. The old code bypassed ANY port-8080 traffic
                 // (including public :8080), which sent it out through the
                 // native route — an unproxied egress, i.e. "public IP
@@ -727,35 +725,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 9. ConnectGate policy (report §03): a RECOVERED flow must never lower
-    //    the limit, and a downgrade needs repeated windowed evidence.
-    {
-        ConnectGate g;
-        int cap0 = g.Cap();
-        // A flow that failed once and then succeeded: "recovered" must not
-        // halve the cap. This was the negative feedback that produced the
-        // field log's 95 gate cancellations.
-        g.ReportOutcome(false, true, 300);
-        Check(g.Cap() == cap0,
-              "gate: a recovered flow does NOT lower the concurrency cap",
-              "cap " + std::to_string(cap0) + " -> " + std::to_string(g.Cap()));
-        // A single saturation event must not halve it either.
-        g.ReportOutcome(true, false, 300);
-        Check(g.Cap() == cap0,
-              "gate: ONE saturation event does NOT halve the cap",
-              "cap " + std::to_string(g.Cap()));
-        // Repeated refusals inside the window DO downgrade, but never below 3.
-        for (int i = 0; i < 6; ++i) g.ReportOutcome(true, false, 300);
-        Check(g.Cap() >= 3 && g.Cap() <= 4,
-              "gate: repeated saturation downgrades but never below 3",
-              "cap " + std::to_string(g.Cap()));
-        // A fixed policy disables adaptation entirely (report §03 A/B test).
-        ConnectGate g2;
-        g2.Configure(6);
-        for (int i = 0; i < 10; ++i) g2.ReportOutcome(true, false, 300);
-        Check(g2.Cap() == 6, "gate: fixed policy disables adaptation",
-              "cap " + std::to_string(g2.Cap()));
-    }
+    // 9. beta0.2.0: the ConnectGate is GONE (ProxyBridge architecture — no
+    //    local admission queue). Its policy assertions died with it; the
+    //    failure path is covered by test 10 (refusal classification) and
+    //    the RST-on-failure behaviour of TcpWorker itself.
 
     // 10. SOCKS5 failure classification (report §04): a REFUSED connection
     //     must NOT be reported as a timeout. The field log claimed

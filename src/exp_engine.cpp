@@ -407,155 +407,19 @@ struct TcpRegistry {
     std::vector<std::shared_ptr<TcpSession>> live;
 };
 
-// Concurrency control, beta0.1.7.
+// Concurrency control, REMOVED in beta0.2.0 (ProxyBridge architecture).
 //
-// Reference: ProxyBridge Windows/src/pb_relay.c:1030 (relay_pool_start, a
-// fixed pool of IOCP workers — one task per connection, NO queuing of
-// handshakes) and TqkLibrary TcpRelayServer.cs:112 (`Task.Run` per accepted
-// connection). Neither mature redirector serialises proxy handshakes.
+// The admission gate was an exp invention; neither ProxyBridge
+// (pb_relay.c connection_handler) nor wfp-divert (TcpProxyWorker) queues
+// or caps proxy handshakes. Every accepted flow gets a thread that does
+// ONE blocking SOCKS5 CONNECT with a 4s control-plane timeout; on failure
+// the app socket is RST immediately (ProxyBridge reset_close) so the
+// application retries on its own schedule instead of sitting in a local
+// queue. The field logs told this story three times: 0.1.6 (queue wait
+// reported as phone latency), 0.1.7 (cap collapse -> 8s queue wall -> 95
+// cancellations), 0.1.8/0.1.9 (phone-side serialisation at cap 8). The
+// gate itself was the bug; the phone queues naturally when overloaded.
 //
-// Why the old gate was wrong: beta0.1.6 set cap=3 with a 30s queue, and
-// TcpWorker took its start timestamp BEFORE Acquire(). The 0.1.6 field log
-// therefore reported "手机已接通 12716ms / 6351ms / 6346ms" while other
-// connections in the same burst took 45-99ms — those numbers were QUEUE
-// WAIT, not phone latency. A game opening 10+ sockets at once waited 6-12s
-// for its TLS bytes and failed with code=-306. That is the "很卡" symptom.
-//
-// beta0.1.8 (report §03) — the AIMD feedback loop was the ROOT CAUSE of the
-// field log's 95 gate cancellations:
-//
-//   ReportOutcome(transient_failure || connect_ms > 2500) -> cap /= 2
-//
-// Three defects combined into a death spiral:
-//   1. A dial that failed once and SUCCEEDED on retry still passed
-//      had_transient=true, so a RECOVERED flow halved the limit.
-//   2. The floor was 2. With 40+ concurrent SYNs, cap 2 turned the queue
-//      into an 8s wall; the field log shows 排队 p95 7285ms, 闸门取消 95,
-//      阻断 734, and every stats line frozen afterwards.
-//   3. A single failure halves immediately — no window, no evidence that the
-//      phone is actually saturated.
-//
-// Now: a downgrade requires EVIDENCE OF PHONE SATURATION that repeats inside
-// a window (explicit REP refusal or repeated timeouts), never a single
-// transient event and never a flow that eventually succeeded. The floor is 4
-// so a burst can never collapse the queue to nothing.
-struct ConnectGate {
-    std::mutex m;
-    std::condition_variable cv;
-    int cur = 0;
-    // beta0.1.9: the 0.1.8 field screenshots show CONNECT latencies of
-    // 53ms / 90ms / 110ms but ALSO 3064ms and 3070ms with 排队 0ms on the PC
-    // side. The queue the burst lands in is on the PHONE, not here: the PC
-    // gate now admits 8 concurrent handshakes and the phone's Kotlin
-    // ProxyServer serialises them. beta0.1.6 already measured that the same
-    // phone answers in 40-90ms when the PC keeps the handshake concurrency
-    // low. Start conservative; AIMD can still climb when the phone keeps up.
-    int cap = 4;
-    int min_cap = 3;   // never collapse to 2 (field log: cap 2 => deadlock)
-    int max_cap = 8;
-    bool adaptive = true;
-    int success_streak = 0;
-    // Saturation evidence inside a rolling window.
-    std::vector<std::chrono::steady_clock::time_point> refuse_events;
-    std::vector<std::chrono::steady_clock::time_point> timeout_events;
-    int queued = 0;          // flows currently waiting for a slot
-
-    bool Acquire(std::atomic<bool>* stop, int timeout_ms,
-                 int* waited_ms = nullptr) {
-        auto t0 = std::chrono::steady_clock::now();
-        std::unique_lock<std::mutex> lk(m);
-        ++queued;
-        bool signalled = cv.wait_for(
-            lk, std::chrono::milliseconds(timeout_ms), [&] {
-                return cur < cap || (stop && !stop->load());
-            });
-        --queued;
-        if (waited_ms)
-            *waited_ms = static_cast<int>(std::chrono::duration_cast<
-                std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - t0).count());
-        if (!signalled) return false;               // timed out: no slot
-        if (stop && !stop->load()) return false;    // engine stopping
-        if (cur >= cap) return false;
-        ++cur;
-        return true;
-    }
-    void Release() {
-        std::lock_guard<std::mutex> lk(m);
-        if (cur > 0) --cur;
-        cv.notify_one();
-    }
-    // beta0.1.8: the outcome now carries EVIDENCE, not a guess.
-    //   saturated   — the phone gave an explicit refusal or repeated timeout
-    //   recovered   — the flow eventually succeeded (must NOT be punished)
-    //   connect_ms  — real dial latency
-    void ReportOutcome(bool saturated, bool recovered, int connect_ms) {
-        std::lock_guard<std::mutex> lk(m);
-        if (!adaptive) return;
-        auto now = std::chrono::steady_clock::now();
-        auto cutoff = now - std::chrono::seconds(10);
-        if (saturated) {
-            refuse_events.push_back(now);
-            success_streak = 0;
-        } else {
-            timeout_events.push_back(now);
-        }
-        // keep only the window
-        while (!refuse_events.empty() && refuse_events.front() < cutoff)
-            refuse_events.erase(refuse_events.begin());
-        while (!timeout_events.empty() && timeout_events.front() < cutoff)
-            timeout_events.erase(timeout_events.begin());
-        // A recovered flow must never lower the ceiling — that was the
-        // negative feedback that killed the field run.
-        if (recovered) {
-            if (++success_streak >= 8) {
-                cap = std::min(max_cap, cap + 1);
-                success_streak = 0;
-            }
-            cv.notify_all();
-            return;
-        }
-        if (++success_streak >= 4) {
-            cap = std::min(max_cap, cap + 1);
-            success_streak = 0;
-            cv.notify_all();
-            return;
-        }
-        // Downgrade ONLY on repeated, windowed evidence of saturation:
-        // 3 explicit refusals, or 5 timeouts, inside 10 seconds.
-        bool window_saturated =
-            refuse_events.size() >= 3 || timeout_events.size() >= 5;
-        if (window_saturated && cap > min_cap) {
-            cap = std::max(min_cap, cap / 2);
-            success_streak = 0;
-        }
-        cv.notify_all();
-    }
-    int Cap() {
-        std::lock_guard<std::mutex> lk(m);
-        return cap;
-    }
-    int Queued() {
-        std::lock_guard<std::mutex> lk(m);
-        return queued;
-    }
-    void Configure(int fixed_cap) {
-        std::lock_guard<std::mutex> lk(m);
-        if (fixed_cap > 0) {
-            adaptive = false;
-            // Only the deadlock floor is enforced; an explicit user override
-            // (exp_policy.ini ConnectConcurrency, the 4/8/12 experiment) may
-            // exceed max_cap on purpose.
-            cap = std::max(min_cap, fixed_cap);
-        }
-        cv.notify_all();
-    }
-    void WakeAll() {
-        std::lock_guard<std::mutex> lk(m);
-        cv.notify_all();
-    }
-};
-
 // Aggregate counters (plan §5.3: 会话闭环证据). Shared via shared_ptr so
 // detached workers can still account their last bytes safely during Stop.
 struct EngineStats {
@@ -580,13 +444,9 @@ struct EngineStats {
     std::atomic<uint64_t> inject_attempt{0};
     std::atomic<uint64_t> inject_ok{0};
     std::atomic<uint64_t> inject_fail{0};
-    std::atomic<uint64_t> gate_timeout{0};   // F04: cancelled, no CONNECT
-    // beta0.1.8: a cancellation caused by the user pressing disconnect is a
-    // different event from a full local queue. They shared one counter,
-    // which made local congestion look like an engine fault.
-    std::atomic<uint64_t> gate_engine_stop{0};
-    std::atomic<uint64_t> connect_retry{0};  // beta0.1.5: transient retry
-    std::atomic<uint64_t> connect_retry_ok{0};
+    // beta0.2.0: gate counters (gate_timeout / gate_engine_stop /
+    // connect_retry) are GONE with the gate — ProxyBridge has no local
+    // queue to cancel from and no retry layer of its own.
     // beta0.1.5: prove UDP is actually taken over. The old stats were all
     // zero because every UDP datagram that reached the LAN-bypass branch
     // was silently reinjected and counted nowhere.
@@ -627,11 +487,6 @@ struct EngineStats {
     // so a game's QUIC traffic is observable instead of vanishing silently.
     std::atomic<uint64_t> udp443_seen{0};
 
-    // ---- beta0.1.7 (reference-driven) ---------------------------------
-    // Queue wait is measured SEPARATELY from CONNECT latency. The 0.1.6 log
-    // mixed them and made a 45ms phone look like a 12-second phone.
-    std::mutex gate_wait_mtx;
-    std::vector<int> gate_wait_ms;
     // ProxyBridge conntrack: stale per-port state must die on a fresh SYN,
     // and FIN/RST must retire a mapping immediately. Retransmitted SYNs are
     // dropped instead of reflected twice (Tqk HoldSynForReconcile).
@@ -1131,100 +986,39 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
                uint64_t flow_id,
                std::function<void(const std::wstring&)> log,
                TcpRegistry* reg, std::shared_ptr<EngineStats> stats,
-               ConnectGate* gate, std::atomic<bool>* stop,
+               std::atomic<bool>* stop,
                std::atomic<int>* budget) {
     std::wstring dstw = IpW(htonl(entry.orig_dst_ip)) + L":" +
                         std::to_wstring(entry.orig_dst_port);
-    // beta0.1.7: queue wait is measured separately and MUST NOT be reported
-    // as CONNECT latency (see ConnectGate comment). Reference implementations
-    // do not queue handshakes at all, so the timeout is short and adaptive.
-    int waited_ms = 0;
-    if (!gate->Acquire(stop, 8000, &waited_ms)) {
-        // beta0.1.8 (report §03): split the two causes. "ENGINE_STOP" means
-        // the user pressed disconnect; "GATE_TIMEOUT" means the local queue
-        // was full. They used to share one message, which made a local
-        // congestion problem look like an engine fault.
-        bool stopping = (stop && !stop->load());
-        if (stopping)
-            stats->gate_engine_stop.fetch_add(1);
-        else
-            stats->gate_timeout.fetch_add(1);
-        log(L"[exp] #" + std::to_wstring(flow_id) + (stopping
-                ? L" 引擎停止 → 取消（未向手机发起 CONNECT）→ "
-                : L" 闸门超时 GATE_TIMEOUT → 取消（未向手机发起 CONNECT）→ ") +
-            dstw + L"（排队 " + std::to_wstring(waited_ms) + L"ms，队列 " +
-            std::to_wstring(gate->Queued()) + L"，上限 " +
-            std::to_wstring(gate->Cap()) + L"）");
-        // ProxyBridge pb_relay.c:686 — RST instead of a lingering FIN.
+    // NOTE: this pointer is &Impl::running (true == engine RUNNING), despite
+    // the historical parameter name "stop".
+    if (!stop->load()) {
+        log(L"[exp] #" + std::to_wstring(flow_id) +
+            L" 引擎停止 → 取消（未向手机发起 CONNECT）→ " + dstw);
         s->want_reset.store(true);
         SessionFinalize(s, reg, stats, budget);
         return;
     }
-    {
-        std::lock_guard<std::mutex> lk(stats->gate_wait_mtx);
-        if (stats->gate_wait_ms.size() < 512)
-            stats->gate_wait_ms.push_back(waited_ms);
-    }
-    // t0 starts HERE: only the real SOCKS5 dial is measured now.
+    // beta0.2.0 (ProxyBridge pb_relay.c connection_handler): ONE blocking
+    // SOCKS5 dial per accepted flow. No admission gate, no retry loop —
+    // both were exp inventions that turned congestion into a death spiral
+    // (0.1.7: 18.5s slot hold, cap collapse, 95 cancellations; 0.1.8/9:
+    // the same load serialised inside the phone instead). The application's
+    // own SYN retransmission is the retry: same ISN keeps the NAT mapping,
+    // a new SYN starts a fresh flow. Failure = immediate RST to the app
+    // (ProxyBridge reset_close), so the app errors NOW and retries on its
+    // own schedule instead of waiting out its 5s business timeout.
     auto t0 = std::chrono::steady_clock::now();
-
-    // beta0.1.8 (report §04): the retry loop is where the field run lost
-    // its breath. Each attempt held the gate slot for up to 3 x 6s = 18.5s
-    // ("CONNECT reply missing, 18552ms"), so two sick flows were enough to
-    // starve every other connection when cap was 2. Now:
-    //   * only TRANSIENT failures are retried (an explicit REP verdict is
-    //     the phone's final answer and is NOT retried),
-    //   * the retry budget is 2 attempts, not 3,
-    //   * each stage is timed separately so the log states which of
-    //     tcp / auth / connect actually failed.
     std::string err;
-    SOCKET r = INVALID_SOCKET;
-    bool saturated = false;   // explicit phone refusal
-    bool recovered = false;   // a later attempt succeeded
     ExpSocks5Timing tm{};
     uint32_t local_ip = 0;
-    constexpr int kMaxConnectAttempts = 2;
-    for (int attempt = 0; attempt < kMaxConnectAttempts; ++attempt) {
-        // NOTE: this pointer is &Impl::running (true == engine RUNNING),
-        // despite the historical parameter name "stop".
-        if (!stop->load()) break;
-        err.clear();
-        tm = ExpSocks5Timing{};
-        r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
-                                htonl(entry.orig_dst_ip),
-                                htons(entry.orig_dst_port), &err, &tm,
-                                &local_ip);
-        if (r != INVALID_SOCKET) {
-            if (attempt > 0) {
-                stats->connect_retry_ok.fetch_add(1);
-                recovered = true;   // NEVER punish a recovered flow
-            }
-            break;
-        }
-        if (attempt == 0) stats->connect_retry.fetch_add(1);
-        // Classify the failure with the new machine-readable prefixes.
-        bool is_refusal = err.find("CONNECT_REJECTED") != std::string::npos ||
-                          err.find("TCP_CONNECT_FAILED") != std::string::npos;
-        bool is_timeout = err.find("CONNECT_REPLY_MISSING") != std::string::npos ||
-                          err.find("SELECT_TIMEOUT") != std::string::npos ||
-                          err.find("SELECT_ERROR") != std::string::npos ||
-                          err.find("reply missing") != std::string::npos ||
-                          err.find("timeout") != std::string::npos ||
-                          err.find("timed out") != std::string::npos ||
-                          err.find("unreachable") != std::string::npos;
-        bool is_send = err.find("CONNECT_SEND_FAILED") != std::string::npos ||
-                       err.find("send failed") != std::string::npos;
-        if (is_refusal) saturated = true;
-        bool transient = is_timeout || is_send;
-        if (!transient || attempt + 1 >= kMaxConnectAttempts) break;
-        Sleep(250);
-    }
+    SOCKET r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
+                                   htonl(entry.orig_dst_ip),
+                                   htons(entry.orig_dst_port), &err, &tm,
+                                   &local_ip);
     int dial_ms = static_cast<int>(std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
         .count());
-    gate->Release();
-    // Evidence-based report: a flow that succeeded never lowers the cap.
-    gate->ReportOutcome(saturated, recovered || r != INVALID_SOCKET, dial_ms);
 
     if (r == INVALID_SOCKET) {
         stats->socks_fail.fetch_add(1);
@@ -1254,8 +1048,7 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     ConfigureRelaySocket(r, true);
     s->start = t0;
     log(L"[exp] #" + std::to_wstring(flow_id) + L" 手机已接通 → " + dstw +
-        L" (CONNECT " + std::to_wstring(dial_ms) + L"ms, 排队 " +
-        std::to_wstring(waited_ms) + L"ms)");
+        L" (CONNECT " + std::to_wstring(dial_ms) + L"ms)");
     std::thread t1(Pump, s.get(), 0);
     std::thread t2(Pump, s.get(), 1);
     t1.join();
@@ -1739,10 +1532,6 @@ struct ExpEngine::Impl {
     bool phone_only_uplink = true;
     DWORD uplink_if = 0;
 
-    // beta0.1.7: adaptive concurrency, short bounded queue, AIMD on phone
-    // saturation. See ConnectGate for the ProxyBridge/Tqk provenance.
-    ConnectGate connect_gate;
-
     // exp_policy.ini switches; defaults reproduce beta0.1.6 behaviour.
     ExpPolicy policy;
 
@@ -1832,7 +1621,7 @@ void ExpEngine::Impl::AcceptLoop() {
             tcp_reg.live.push_back(s);
         }
         std::thread(TcpWorker, s, entry, phone8, cfg.phone_port, auth,
-                    flow_id, log, &tcp_reg, stats, &connect_gate, &running,
+                    flow_id, log, &tcp_reg, stats, &running,
                     &tcp_budget).detach();
     }
     closesocket(listener);
@@ -1952,7 +1741,7 @@ void ExpEngine::Impl::ExpireLoop() {
             const wchar_t* st = StateName(state.load());
             // Handshake latency distribution: if p95 is in seconds the
             // bottleneck is the phone SOCKS5 server, not the local relay.
-            int p50 = 0, p95 = 0, cmax = 0, q95 = 0;
+            int p50 = 0, p95 = 0, cmax = 0;
             {
                 std::lock_guard<std::mutex> lk(stats->connect_ms_mtx);
                 std::vector<int> v(stats->connect_ms);
@@ -1963,19 +1752,10 @@ void ExpEngine::Impl::ExpireLoop() {
                     cmax = v.back();
                 }
             }
-            {
-                std::lock_guard<std::mutex> lk(stats->gate_wait_mtx);
-                std::vector<int> v(stats->gate_wait_ms);
-                if (!v.empty()) {
-                    std::sort(v.begin(), v.end());
-                    q95 = v[(v.size() * 95) / 100];
-                }
-            }
             log(L"[exp] 统计[" + std::wstring(st) + L"]: TCP 活动 " +
                 std::to_wstring(tcp_budget.load()) +
                 L" | 成功 " + std::to_wstring(stats->socks_ok.load()) +
                 L" 失败 " + std::to_wstring(stats->socks_fail.load()) +
-                L" 闸门取消 " + std::to_wstring(stats->gate_timeout.load()) +
                 L" | ↑" + HUMAN_BYTES(stats->bytes_up.load()) +
                 L" ↓" + HUMAN_BYTES(stats->bytes_down.load()) +
                 L" | 捕获 " + std::to_wstring(stats->recv_ok.load()) +
@@ -2000,13 +1780,9 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" | UDP 捕获 " + std::to_wstring(stats->udp_capture.load()) +
                 L" 局域网 " + std::to_wstring(stats->udp_lan_pass.load()) +
                 L" 代理 " + std::to_wstring(stats->udp_proxy.load()) +
-                L" | 闸门重试 " + std::to_wstring(stats->connect_retry.load()) +
-                L" 成功 " + std::to_wstring(stats->connect_retry_ok.load()) +
-                L" | 并发上限 " + std::to_wstring(connect_gate.Cap()) +
                 L" | CONNECT p50 " + std::to_wstring(p50) +
                 L" p95 " + std::to_wstring(p95) +
                 L" 最大 " + std::to_wstring(cmax) + L"ms" +
-                L" | 排队 p95 " + std::to_wstring(q95) + L"ms（应与 CONNECT 分离）" +
                 L" | 零字节关闭 " + std::to_wstring(stats->tcp_zero_close.load()) +
                 L" 手机先关 " + std::to_wstring(stats->tcp_eof_remote.load()) +
                 L" 应用先关 " + std::to_wstring(stats->tcp_eof_app.load()) +
@@ -2047,7 +1823,6 @@ void ExpEngine::Impl::MainLoop() {
             // UI is told explicitly, and every waiting worker is released.
             if (running.load()) {
                 running.store(false);
-                connect_gate.WakeAll();
                 SetFault(L"WinDivert 捕获已停止 (err=" +
                          std::to_wstring((unsigned long long)e) +
                          L")，数据面不再转发");
@@ -2523,15 +2298,12 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     I->state.store(Impl::kStarting);
     I->policy = LoadPolicy();
     I->dnsproxy.aaaa_suppress.store(I->policy.aaaa_suppress);
-    I->connect_gate.Configure(I->policy.concurrency);
     I->log(L"[exp] 策略: UDP443=" +
            std::wstring(I->policy.udp443_drop ? L"drop" : L"proxy") +
            L" IPv6=" +
            (I->policy.ipv6_allow ? L"allow(测试)" : L"block") +
            L" AAAA=" +
            (I->policy.aaaa_suppress ? L"suppress" : L"allow(测试)") +
-           L" 并发=" + std::to_wstring(I->connect_gate.Cap()) +
-           (I->policy.concurrency > 0 ? L"(固定)" : L"(自适应)") +
            L" 防火墙入站=" +
            (I->policy.firewall_allow ? L"允许添加" : L"仅检测"));
     if (I->policy.firewall_allow) {
@@ -2786,7 +2558,6 @@ void ExpEngine::Stop() {
     // below is idempotent, so always run it.
     I->running.exchange(false);
     I->state.store(Impl::kStopped);
-    I->connect_gate.WakeAll();   // F04: release every queued handshake
     I->status(L"断开中…");
     if (I->divert != INVALID_HANDLE_VALUE) {
         I->wd.close(I->divert);

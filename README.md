@@ -1,6 +1,10 @@
 # LinkHelm-exp
 
-**beta0.1.0 — 实验版：无虚拟网卡透明上网（WinDivert + SOCKS5）**
+**beta0.2.0 — 实验版：基于 LinkHelm 1.1.3 基线重建，无虚拟网卡透明上网（WinDivert + SOCKS5）**
+
+本仓库是 LinkHelm 的独立实验分支。beta0.2.0 起源码基线为 **v1.1.3**（`backup_v1.1.3/`：
+UI 美化 / 重连治理 / ICS / 文件传输原样保留），删除 Wintun+lwIP 与商店加速，
+数据面改用 WinDivert+SOCKS5（relay 层对齐 ProxyBridge 架构）。
 
 本仓库是 LinkHelm v1.1.0 C++ 桌面端的独立实验分支（独立于主线稳定仓库）。
 目标：**不创建 TUN/虚拟网卡、不改系统默认路由**，让 Windows 本机应用透明地
@@ -139,6 +143,30 @@ UDP/53 会被捕获」（DNS 兜底路径可达 —— 直接对应 Wi-Fi 的 In
 用于区分「Windows 流量绕过」和「手机蜂窝 CGNAT 轮换」。
 
 ## Changelog
+
+### beta0.2.0 — 基于 LinkHelm 1.1.3 基线重建 + ProxyBridge relay 架构（无闸门）
+
+**为什么重建**：0.1.x 分支在真机上始终无法稳定上网，且 patch 叠 patch 已难维护。
+beta0.2.0 回到用户验证过的 **1.1.3 源码**（`backup_v1.1.3/`）：
+
+* **保留 1.1.3 全部 UI 成果**：UI 美化、重连治理（10 次封顶、随时可断开）、探测间隔校准、入站表单栅格；连接页 + 共享传输页两页 UI 原样。
+* **删除（防冗余）**：`accel_controller`（商店加速整页）、`subscription`、`tun_manager`（Wintun+lwIP 整条数据面）、`relay`、mihomo/hev-socks5-tunnel 依赖。
+* **新增**：`exp_engine` + `exp_socks5`（WinDivert 捕获 + SOCKS5，来自 0.1.x 但 relay 层按 ProxyBridge 重写）。
+* **单实例互斥量/窗口类改用 exp 专属名**（`LinkHelmExpSingleton`/`LinkHelmExpWindow`）：主线 1.1.3 与 exp 可并存运行，互不阻塞。
+
+**relay 层重写（对照 `refs/proxybridge` pb_relay.c / `exp_ref/wfp-divert-main` divert.cpp 逐行核对）**
+
+| 机制 | 0.1.x（已证坏） | beta0.2.0（ProxyBridge 架构） |
+| --- | --- | --- |
+| 并发控制 | ConnectGate 排队闸门 + AIMD（0.1.6/0.1.7/0.1.8/0.1.9 四轮真机故障均源于或困于此） | **整体删除**——ProxyBridge/wfp-divert 都无闸门无排队，每 accept 一线程直接阻塞 CONNECT |
+| 上游握手 | 重试 2 次 + 三态分类 | **单次阻塞 CONNECT**（4s 控制面超时）；应用自己的 SYN 重传就是天然重试（同 ISN 保映射、异 ISN 新代际） |
+| 失败路径 | RST | **立即 RST**（reset_close），应用马上报错并按自己的节奏重试，不再在本地队列里干等 |
+| socket 配置 | 1MB 缓冲 | 不变（TCP_NODELAY + 握手期超时→传输期清零 + keepalive 5min/1s），Pump 128KB |
+| 保留的正确部分 | ISN 区分重传、underlay 端点匹配（IP+端口）、手机 UDP/53 捕获、DNS 本地代理、retry_at 原子 | 全部保留 |
+
+**验收（本机，一次编译一次运行）**：自测 **15/15 PASS**（闸门策略断言随闸门删除；新增验证「CONNECT 失败 → 15ms 内对应用侧 RST err=10054」与 1KB/1MB 四节点字节精确闭环）。冒烟：标题 `LinkHelm-exp beta0.2.0 (WinDivert, no virtual adapter)`，可与主线 1.1.3 同时运行。
+
+**边界不变**：开发机无管理员权限，WinDivert NETWORK 层真实捕获/回注仍未实测；真机先跑 `tests\driver_probe.exe <手机IP>`（A/B/C 三步）再看数据面。
 
 ### beta0.1.9 — TCP 数据面对齐 ProxyBridge（针对 beta0.1.8 真机「TCP 几乎全挂」截图）
 

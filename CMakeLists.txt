@@ -1,6 +1,7 @@
 # LinkHelm-exp — experimental transparent data plane (WinDivert + SOCKS5).
 #
-# Source of truth: a trimmed copy of the LinkHelm v1.1.0 C++ desktop app.
+# beta0.2.0: rebuilt ON TOP OF the LinkHelm v1.1.3 C++ desktop app
+# (backup_v1.1.3/): 1.1.3 UI (beautified, reconnect governor) kept verbatim,
 #   removed: accel_controller, subscription, relay, tun_manager (Wintun+lwIP)
 #   added:   exp_socks5 (RFC 1928/1929 client), exp_engine (WinDivert
 #            capture + TCP reflection + UDP ASSOCIATE pool + half-routes)
