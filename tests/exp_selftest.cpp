@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.1.7 — MINIMAL end-to-end self-test.
+// LinkHelm-exp beta0.1.8 — MINIMAL end-to-end self-test.
 //
 // Design rule (per review): no pure-function / mock / self-attesting asserts.
 // Every Check() below crosses a REAL socket boundary against an in-process
@@ -353,7 +353,7 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.1.7 end-to-end self-test ===\n");
+    std::printf("=== LinkHelm-exp beta0.1.8 end-to-end self-test ===\n");
     std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
                 "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 
@@ -550,7 +550,8 @@ int main(int argc, char** argv) {
                 v4[0] = 0x45; v4[3] = 40; v4[9] = 6;
                 v4[12] = 192; v4[13] = 168; v4[14] = 49; v4[15] = 74;
                 v4[16] = 8; v4[17] = 8; v4[18] = 8; v4[19] = 8;
-                v4[20] = 0xC3; v4[21] = 0x50; v4[22] = 0x01; v4[23] = 0xBB;
+                // [20..21]=SrcPort [22..23]=DstPort
+                v4[22] = 0x01; v4[23] = 0xBB;
                 v4[32] = 0x50; v4[33] = 0x02;
                 WINDIVERT_ADDRESS ad{}; ad.Outbound = 1;
                 WINDIVERT_ADDRESS ad_imp = ad; ad_imp.Impostor = 1;
@@ -572,9 +573,89 @@ int main(int argc, char** argv) {
                           std::to_string(cap6) + " impostor=" +
                           std::to_string(excl_imp) + " phone=" +
                           std::to_string(excl_phone));
+
+                // beta0.1.8 (§06): DNS to the PHONE must be captured so the
+                // "WinDivert intercepts DNS" fallback is reachable. The old
+                // filter excluded the whole phone IP, which made that
+                // fallback unreachable by construction -> NCSI flickered.
+                // IPv4 header: [12..15]=SrcAddr [16..19]=DstAddr [20..21]=SrcPort
+                // [22..23]=DstPort (same offsets for TCP and UDP).
+                v4[16] = 192; v4[17] = 168; v4[18] = 49; v4[19] = 1;  // phone
+                v4[9] = 17;                                             // UDP
+                v4[22] = 0x00; v4[23] = 0x35;                          // DstPort 53
+                bool cap_phone_dns = eval(f.c_str(), v4, sizeof(v4), &ad) == TRUE;
+                // ... but TCP to the phone's SOCKS5 port must NOT be captured
+                // (it is the underlay; capturing it would proxy the proxy).
+                v4[9] = 6;                                             // TCP
+                v4[22] = 0x1F; v4[23] = 0x90;                          // DstPort 8080
+                bool excl_phone_socks = eval(f.c_str(), v4, sizeof(v4), &ad) != TRUE;
+                Check(cap_phone_dns && excl_phone_socks,
+                      "filter: phone UDP/53 captured (DNS fallback reachable),"
+                      " phone TCP/SOCKS5 excluded (no proxy loop)",
+                      "phone_dns=" + std::to_string(cap_phone_dns) +
+                          " phone_socks=" + std::to_string(excl_phone_socks));
+
+                // beta0.1.8 (§05): a PUBLIC service on port 8080 must be
+                // captured. The old code bypassed ANY port-8080 traffic
+                // (including public :8080), which sent it out through the
+                // native route — an unproxied egress, i.e. "public IP
+                // flapping".
+                v4[16] = 203; v4[17] = 0; v4[18] = 113; v4[19] = 10;  // public
+                v4[22] = 0x1F; v4[23] = 0x90;                          // DstPort 8080
+                bool cap_public_8080 = eval(f.c_str(), v4, sizeof(v4), &ad) == TRUE;
+                Check(cap_public_8080,
+                      "filter: public :8080 IS captured (not bypassed by port)",
+                      std::to_string(cap_public_8080));
             }
             FreeLibrary(dll);
         }
+    }
+
+    // 9. ConnectGate policy (report §03): a RECOVERED flow must never lower
+    //    the limit, and a downgrade needs repeated windowed evidence.
+    {
+        ConnectGate g;
+        int cap0 = g.Cap();
+        // A flow that failed once and then succeeded: "recovered" must not
+        // halve the cap. This was the negative feedback that produced the
+        // field log's 95 gate cancellations.
+        g.ReportOutcome(false, true, 300);
+        Check(g.Cap() == cap0,
+              "gate: a recovered flow does NOT lower the concurrency cap",
+              "cap " + std::to_string(cap0) + " -> " + std::to_string(g.Cap()));
+        // A single saturation event must not halve it either.
+        g.ReportOutcome(true, false, 300);
+        Check(g.Cap() == cap0,
+              "gate: ONE saturation event does NOT halve the cap",
+              "cap " + std::to_string(g.Cap()));
+        // Repeated refusals inside the window DO downgrade, but never below 4.
+        for (int i = 0; i < 6; ++i) g.ReportOutcome(true, false, 300);
+        Check(g.Cap() >= 4,
+              "gate: repeated saturation downgrades but never below 4",
+              "cap " + std::to_string(g.Cap()));
+        // A fixed policy disables adaptation entirely (report §03 A/B test).
+        ConnectGate g2;
+        g2.Configure(6);
+        for (int i = 0; i < 10; ++i) g2.ReportOutcome(true, false, 300);
+        Check(g2.Cap() == 6, "gate: fixed policy disables adaptation",
+              "cap " + std::to_string(g2.Cap()));
+    }
+
+    // 10. SOCKS5 failure classification (report §04): a REFUSED connection
+    //     must NOT be reported as a timeout. The field log claimed
+    //     "phone SOCKS5 unreachable (timeout)" at 532ms with a 3000ms
+    //     budget, because select()'s exception set was lumped in.
+    {
+        std::string err;
+        // Port 1 on loopback is not listening -> the connection is REFUSED.
+        SOCKET s = ExpSocks5TcpConnect("127.0.0.1", 1, ExpAuth{"u", "p"},
+                                       inet_addr("1.2.3.4"), htons(80),
+                                       &err);
+        Check(s == INVALID_SOCKET &&
+                  err.find("TCP_CONNECT_FAILED") != std::string::npos,
+              "SOCKS5 dial: refused connection is classified, not 'timeout'",
+              err);
+        if (s != INVALID_SOCKET) closesocket(s);
     }
 
     std::printf("\n=== RESULT: %d passed, %d failed ===\n",

@@ -26,11 +26,31 @@ struct ExpAuth {
 bool ExpSocks5Precheck(const std::string& phone_ip, uint16_t phone_port,
                        const ExpAuth& auth, std::string* err);
 
+// Per-stage timing of one SOCKS5 dial. All values in milliseconds.
+// beta0.1.8 (report §04): the field log showed "phone SOCKS5 unreachable
+// (timeout)" at 532ms while the dial budget was 3000ms — the exception set
+// of select() was lumped together with a genuine timeout, so a refused or
+// reset connection was reported as an unreachable phone. The stage timings
+// tell the three failure domains apart:
+//   * tcp_ms    — establishing the TCP connection to the phone
+//   * auth_ms   — SOCKS5 greeting + RFC1929 subnegotiation
+//   * connect_ms— the CONNECT request/reply round trip
+struct ExpSocks5Timing {
+    int tcp_ms = 0;
+    int auth_ms = 0;
+    int connect_ms = 0;
+    int total_ms = 0;
+};
+
 // Dial the phone SOCKS5 and CONNECT to dst (network-order ip:port).
 // Returns a valid SOCKET or INVALID_SOCKET (err filled).
+// *timing (optional) receives the per-stage durations; *local_ip_net
+// (optional) receives the local source address used for the dial.
 SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
                            const ExpAuth& auth, uint32_t dst_ip_net,
-                           uint16_t dst_port_net, std::string* err);
+                           uint16_t dst_port_net, std::string* err,
+                           ExpSocks5Timing* timing = nullptr,
+                           uint32_t* local_ip_net = nullptr);
 
 struct ExpUdpAssoc {
     SOCKET ctrl = INVALID_SOCKET;   // TCP control connection (owns the assoc)

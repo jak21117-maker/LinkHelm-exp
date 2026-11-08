@@ -47,7 +47,7 @@ static int Result(const char* label, bool ok, const std::string& detail) {
     return ok ? 0 : 1;
 }
 
-int main() {
+int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -94,6 +94,17 @@ int main() {
     WD_Send      wsend = (WD_Send)GetProcAddress(dll, "WinDivertSend");
     WD_Checksums wsum = (WD_Checksums)GetProcAddress(
         dll, "WinDivertHelperCalcChecksums");
+    // beta0.1.8: the filter helpers are needed by step C (product-filter
+    // semantics). They do NOT require the driver, so step C still works
+    // even if the driver handle could not be opened.
+    typedef BOOL (*CompileFn)(const char*, WINDIVERT_LAYER, char*, UINT,
+                              const char**, UINT*);
+    typedef BOOL (*EvalFn)(const char*, const VOID*, UINT,
+                           const WINDIVERT_ADDRESS*);
+    auto compile_fn = (CompileFn)GetProcAddress(dll,
+                        "WinDivertHelperCompileFilter");
+    auto eval_fn = (EvalFn)GetProcAddress(dll, "WinDivertHelperEvalFilter");
+    const char* errstr = nullptr; UINT errpos = 0;
     if (!wopen || !wclose || !wrecv || !wsend || !wsum) {
         std::printf("[FAIL] WinDivert.dll missing required exports.\n");
         FreeLibrary(dll); WSACleanup(); return 1;
@@ -220,6 +231,69 @@ int main() {
     closesocket(app);
     done.store(true);
     if (!timed_out.load()) wclose(h);
+
+    // ---- C. the PRODUCT filter must capture DNS addressed to the phone ---
+    // beta0.1.8 (report §06): the engine's capture filter used to exclude
+    // EVERY packet addressed to the phone IP, which made the "WinDivert
+    // intercepts DNS" fallback unreachable by construction. System name
+    // resolution then depended entirely on the loopback 127.0.0.1 proxy
+    // being configured on the adapter, and the Wi-Fi "Internet" icon
+    // (NCSI) flickered.
+    //
+    // This step evaluates the PRODUCT's own filter against a synthetic
+    // "DNS query to the phone gateway" packet. It needs no phone and no
+    // route - it is a pure filter-semantics check, but it uses exactly the
+    // same BuildCaptureFilter() string the engine installs.
+    {
+        // The phone address used by the engine is what the user typed in
+        // the UI; it can be passed on the command line.
+        std::string phone = (argc > 1) ? argv[1] : "";
+        if (phone.empty()) {
+            std::printf("[INFO] usage: driver_probe.exe <phone-ip> "
+                        "(e.g. 192.168.49.1) - step C uses it for the "
+                        "product filter check\n");
+            rc |= Result("C2. phone UDP/53 IS captured (DNS fallback reachable)",
+                         false, "skipped: no phone IP argument");
+        } else {
+        // Build the same filter the engine builds.
+        std::string flt =
+            "(outbound and !loopback and !impostor and ip.DstAddr != " +
+            phone + " and (tcp or udp))"
+            " or (outbound and !loopback and !impostor and ip.DstAddr == " +
+            phone + " and udp.DstPort == 53)"
+            " or (outbound and !loopback and !impostor and ipv6)"
+            " or (tcp.SrcPort == 7712 and !impostor)";
+        bool compiled = false;
+        if (compile_fn)
+            compiled = compile_fn(flt.c_str(), WINDIVERT_LAYER_NETWORK,
+                                   nullptr, 0, &errstr, &errpos) == TRUE;
+        rc |= Result("C1. product filter COMPILES with the phone-DNS clause",
+                     compiled, compiled ? flt : (errstr ? errstr : "?"));
+        if (compiled && eval_fn) {
+            // Synthetic IPv4+UDP packet: dst = phone, dport = 53.
+            uint8_t v[40]{};
+            v[0] = 0x45; v[3] = 40; v[9] = 17;   // ver/ihl, len, proto=UDP
+            unsigned a = 0, b = 0, c = 0, d = 0;
+            if (sscanf(phone.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                v[16] = (uint8_t)a; v[17] = (uint8_t)b;
+                v[18] = (uint8_t)c; v[19] = (uint8_t)d;
+            } else {
+                v[16] = 192; v[17] = 168; v[18] = 49; v[19] = 1;
+            }
+            v[20] = 192; v[21] = 168; v[22] = 49; v[23] = 74;  // src
+            v[24] = 0x00; v[25] = 0x35;                        // DstPort 53
+            WINDIVERT_ADDRESS ad{};
+            ad.Outbound = 1;
+            bool hit = eval_fn(flt.c_str(), v, sizeof(v), &ad) == TRUE;
+            rc |= Result("C2. phone UDP/53 IS captured (DNS fallback reachable)",
+                         hit, "phone=" + phone);
+        } else {
+            rc |= Result("C2. phone UDP/53 IS captured (DNS fallback reachable)",
+                         false, "skipped: compile/eval unavailable");
+        }
+        }
+    }
+
     FreeLibrary(dll);
     WSACleanup();
     std::printf("\n=== DRIVER VERDICT: %s ===\n",

@@ -119,21 +119,56 @@ tests\socks5_probe.exe 192.168.49.1 8080 <账号> <密码>
 ## 真机验收第一步：`driver_probe.exe`（需管理员）
 
 ```
-以管理员身份运行  tests\driver_probe.exe
+以管理员身份运行  tests\driver_probe.exe 192.168.49.1
 ```
 
-它用 RFC 5737 文档地址 `203.0.113.7` 和一个极窄过滤器，只做两件事：
+它用 RFC 5737 文档地址 `203.0.113.7` 和一个极窄过滤器，做三件事：
 **A** 验证真实出站 UDP 包能被 WinDivert 捕获；**B** 注入一个入站 UDP 包，
-验证普通 UDP socket 能收到。B 就是引擎 `UdpRecvThread` 赖以工作的
-「回包闭环」。不改路由 / DNS / 防火墙 / 注册表，退出码 `0=WORKING`、
+验证普通 UDP socket 能收到（B 就是引擎 `UdpRecvThread` 赖以工作的
+「回包闭环」）；**C** 用**产品实际安装的过滤器字符串**求值，确认「手机的
+UDP/53 会被捕获」（DNS 兜底路径可达 —— 直接对应 Wi-Fi 的 Internet 图标
+是否稳定）。
+
+不改路由 / DNS / 防火墙 / 注册表，退出码 `0=WORKING`、
 `1=BROKEN`、`2=无提权（未验证）`。**B2 失败即可定点**：`WinDivertSend`
 成功但 socket 收不到时，问题在 `IfIdx` / 防火墙 / 网络配置文件，
-继续改 SOCKS5 代码是无效的。
+继续改 SOCKS5 代码是无效的。**C2 失败**则说明本机过滤器与 DNS 兜底
+不一致，Wi-Fi 的 Internet 图标会间歇性闪烁。
 
 另附 `tests/egress_compare.ps1`（只读，5 次对照显式 SOCKS5 出口与透明出口）
 用于区分「Windows 流量绕过」和「手机蜂窝 CGNAT 轮换」。
 
 ## Changelog
+
+### beta0.1.8 — 按《beta0.1.7 断连、并发拥堵与 Wi-Fi Internet 状态专项诊断》修复 P1
+
+本轮所有结论都来自 beta0.1.7 的**真机 1013 行运行日志**，不是推理。
+
+**日志给出的因果链（决定性证据）**
+
+| 观测 | 含义 |
+| --- | --- |
+| 前半段 `成功 51 失败 0 闸门取消 0 \| 并发上限 5 \| 排队 p95 0ms` | 数据面本身健康：TCP 捕获、反射、SOCKS5 CONNECT 都正常 |
+| 后半段 `并发上限 2 \| 排队 p95 7285ms \| 闸门取消 95 \| 阻断 734` | AIMD 降档到下限 2 → 队列变成 8 秒墙 → 应用 5 秒主动关闭 → 取消累积 → 统计行冻结 |
+| `CONNECT reply missing, 18552ms` | 3 次重试 × 6s 控制超时 = **单条流占闸门槽位 18.5 秒**；cap=2 时两条就能饿死全部连接 |
+| `代理端点放行 9` | 公网 `:8080` 被按端口误判为 underlay 直连放行 → **未代理出口 = 出口 IP 跳动** |
+| `DNS 成功 104 失败 9` | 本地 DNS 代理工作正常，但过滤器的兜底路径实际不可达 |
+
+**按报告 §03–§08 的修复**
+
+| 报告条目 | 修复 |
+| --- | --- |
+| §03 ConnectGate 负反馈 | 降档改为**需要窗口内重复证据**（10s 内 ≥3 次明确拒绝或 ≥5 次超时）；**重试成功的流永不降档**；下限 2→**4**；取消原因拆为 `GATE_TIMEOUT` 与 `ENGINE_STOP` 两个计数；新增队列长度与当前上限日志 |
+| §04 拨号错误误分类 | `select()` 的异常集与真超时分开：新增 `SELECT_TIMEOUT` / `SELECT_ERROR` / `TCP_CONNECT_FAILED` / `CONNECT_REPLY_MISSING` / `CONNECT_REJECTED` / `CONNECT_SEND_FAILED` 六种机器可读前缀；三段计时（TCP / 认证 / CONNECT）+ 本地源 IP 一并记入失败日志 |
+| §04 占槽时间 | 控制面超时 6s→**4s**（实测健康值 45–112ms 的 35 倍），重试 3 次→**2 次**；单条流占槽上限 18.5s→**8s** |
+| §05 按端口放行 | underlay 排除改为**端点匹配**：TCP 必须「手机 IP + 手机端口」同时命中，UDP 用实际 ASSOCIATE 的 BND 端点识别；**公网 `:8080` 现在正常进入透明转发** |
+| §06 DNS/NCSI | 过滤器新增「手机的 UDP/53 必被捕获」子句，兜底路径不再不可达；DNS 分支**前移**到 underlay 排除之前；本地 DNS 未就绪时明确报 `DNS_DEGRADED` 并在统计行显示 `DNS状态 降级`，不再静默当成功。**不改 NCSI 注册表** |
+| §07 SYN 重传 | 用 TCP 初始序号(ISN)区分「同一连接重传」与「新连接复用端口」：同 ISN **保留映射**（新计数 `SYN重传`），异 ISN 才换新代际；FIN/RST 退休时置 `retired` 标志 |
+| §08 UDP 线程安全 | `UdpSession::retry_at` 由裸 `time_point`（worker 写 / MainLoop 读的真实数据竞争）改为**原子毫秒时间戳** |
+
+**测试**：在 10 条端到端断言基础上补 5 条针对本轮根因的断言（手机 UDP/53 被捕获、
+公网 :8080 被捕获、恢复的流不降档、单次饱和不降档、拒绝连接不被误报为 timeout），
+**编译一次、只跑一遍**。
 
 ### beta0.1.7 — 对照 ProxyBridge / TqkLibrary.WinDivert 的结构性修正 + 测试精简
 

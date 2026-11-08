@@ -6,7 +6,7 @@
 // result to the window; the tray is a plain Shell_NotifyIcon that cannot be
 // "missing from the build".
 //
-// LinkHelm-exp beta0.1.7 — experimental transparent data plane.
+// LinkHelm-exp beta0.1.8 — experimental transparent data plane.
 // The store-boost page is REMOVED; pages: Connect (WinDivert+SOCKS5 engine,
 // ICS sharing) and Share/Transfer (file transfer assistant). No Wintun, no
 // lwIP, no virtual adapter: the phone's SOCKS5 host is reached directly over
@@ -1819,7 +1819,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MessageBoxW(hwnd,
                         g_lang_zh
                             ? L"【产品说明】\n"
-                              L"LinkHelm-exp beta0.1.7（实验版）。无虚拟网卡透明上网："
+                              L"LinkHelm-exp beta0.1.8（实验版）。无虚拟网卡透明上网："
                               L"WinDivert 拦截本机流量，经 Wi-Fi Direct 直连手机上的 "
                               L"SOCKS5 出口（TCP CONNECT + UDP ASSOCIATE，RFC 1929 "
                               L"用户名/密码认证）。不含商店加速；连接、共享(ICS)、"
@@ -1840,7 +1840,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               L"仅供个人学习与合法用途。使用者应遵守所在地法律法规，"
                               L"不得用于任何违法用途。软件按『现状』提供，不附带任何担保。"
                             : L"[Product]\n"
-                              L"LinkHelm-exp beta0.1.7 (experimental). Transparent "
+                              L"LinkHelm-exp beta0.1.8 (experimental). Transparent "
                               L"networking WITHOUT a virtual adapter: WinDivert "
                               L"captures host traffic and forwards it to the "
                               L"SOCKS5 host on your phone over Wi-Fi Direct "
@@ -2070,8 +2070,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     RegisterClassW(&swc);
 
     HWND hwnd = CreateWindowExW(0, kClass,
-        TR(L"LinkHelm-exp beta0.1.7 (WinDivert, no virtual adapter)",
-           L"LinkHelm-exp beta0.1.7（WinDivert 无虚拟网卡实验版）"),
+        TR(L"LinkHelm-exp beta0.1.8 (WinDivert, no virtual adapter)",
+           L"LinkHelm-exp beta0.1.8（WinDivert 无虚拟网卡实验版）"),
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                     WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, kWidth, kHeight,

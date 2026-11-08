@@ -3,6 +3,7 @@
 
 #include <ws2tcpip.h>
 
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -32,12 +33,39 @@ bool RecvAll(SOCKET s, uint8_t* buf, int len) {
 
 // Connect with a hard timeout so a phone that half-dropped Wi-Fi Direct
 // cannot stall the engine for a full TCP SYN timeout.
+//
+// beta0.1.8 (report §04): the previous version collapsed every negative
+// select() outcome into "phone SOCKS5 unreachable (timeout)". The field log
+// therefore reported a timeout at 532ms with a 3000ms budget — the exception
+// set means "the connection FAILED", not "the timer expired". The three
+// cases are now distinguished so the log states WHICH domain failed:
+//   * SELECT_TIMEOUT  — the phone really did not answer in time
+//   * SELECT_ERROR    — select() itself failed (rare)
+//   * TCP_CONNECT_FAILED — the phone REFUSED/RESET the TCP connection
 SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
-                       int timeout_ms, std::string* err) {
+                       int timeout_ms, std::string* err,
+                       int* elapsed_ms = nullptr,
+                       uint32_t* local_ip_net = nullptr) {
+    auto t0 = std::chrono::steady_clock::now();
+    auto ms_since = [&]() {
+        return static_cast<int>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
+    };
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
         if (err) *err = "socket() failed";
         return INVALID_SOCKET;
+    }
+    // Remember which local address the kernel picked for this dial — the
+    // report asks for it to tell a Wi-Fi Direct path from a native one.
+    if (local_ip_net) {
+        sockaddr_in loc{};
+        int ll = sizeof(loc);
+        if (getsockname(s, reinterpret_cast<sockaddr*>(&loc), &ll) == 0)
+            *local_ip_net = loc.sin_addr.s_addr;
+        else
+            *local_ip_net = 0;
     }
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
@@ -48,7 +76,10 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     if (connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == SOCKET_ERROR) {
         int e = WSAGetLastError();
         if (e != WSAEWOULDBLOCK) {
-            if (err) *err = "connect to phone failed (WSA " + std::to_string(e) + ")";
+            if (err) *err = "TCP_CONNECT_FAILED (WSA " + std::to_string(e) +
+                            ") to " + phone_ip + ":" +
+                            std::to_string(phone_port);
+            if (elapsed_ms) *elapsed_ms = ms_since();
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -59,19 +90,48 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
         FD_SET(s, &x);
         timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
         int r = select(0, nullptr, &w, &x, &tv);
-        if (r <= 0 || FD_ISSET(s, &x)) {
-            if (err) *err = "phone SOCKS5 unreachable (timeout)";
+        if (r == 0) {
+            if (err) *err = "SELECT_TIMEOUT (" + std::to_string(ms_since()) +
+                            "ms) to " + phone_ip + ":" +
+                            std::to_string(phone_port);
+            if (elapsed_ms) *elapsed_ms = ms_since();
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+        if (r < 0) {
+            int se = WSAGetLastError();
+            if (err) *err = "SELECT_ERROR (WSA " + std::to_string(se) + ")";
+            if (elapsed_ms) *elapsed_ms = ms_since();
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+        if (FD_ISSET(s, &x)) {
+            // The socket reported an error condition — read the real reason
+            // instead of calling it a timeout.
+            int so = 0, sl = sizeof(so);
+            int g = getsockopt(s, SOL_SOCKET, SO_ERROR,
+                                reinterpret_cast<char*>(&so), &sl);
+            if (g != 0)
+                so = WSAGetLastError();
+            if (err) *err = "TCP_CONNECT_FAILED (WSA " + std::to_string(so) +
+                            ", " + std::to_string(ms_since()) + "ms) to " +
+                            phone_ip + ":" + std::to_string(phone_port);
+            if (elapsed_ms) *elapsed_ms = ms_since();
             closesocket(s);
             return INVALID_SOCKET;
         }
         int so = 0, sl = sizeof(so);
         getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so), &sl);
         if (so != 0) {
-            if (err) *err = "connect refused (WSA " + std::to_string(so) + ")";
+            if (err) *err = "TCP_CONNECT_FAILED (WSA " + std::to_string(so) +
+                            ") to " + phone_ip + ":" +
+                            std::to_string(phone_port);
+            if (elapsed_ms) *elapsed_ms = ms_since();
             closesocket(s);
             return INVALID_SOCKET;
         }
     }
+    if (elapsed_ms) *elapsed_ms = ms_since();
     nb = 0;
     ioctlsocket(s, FIONBIO, &nb);  // back to blocking for the handshake
     // beta0.1.5: the SOCKS5 CONTROL plane had no recv/send timeout at all.
@@ -82,12 +142,13 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     // later flows are starved and the app sees "connected, then dropped".
     // Bound every byte of the handshake. Data-plane sockets override this
     // with their own SO_RCVTIMEO, so this does not change stream behaviour.
-    // beta0.1.6: the field log showed a CONNECT taking 10250ms while the
-    // reflected handshake had already told the app "connected". A single
-    // unresponsive phone handshake held a ConnectGate slot for 10s and
-    // starved every queued flow. 6s still tolerates a slow cellular uplink
-    // but bounds the damage; transient failures are retried by TcpWorker.
-    DWORD tmo = 6000;
+    // beta0.1.8 (report §04): the field log's worst line was
+    //   "CONNECT reply missing, 18552ms" = 3 attempts x 6s.
+    // That flow occupied one ConnectGate slot for 18.5 SECONDS; with cap 2
+    // two such flows starved the whole engine. The measured healthy dial is
+    // 45-112ms, so 4s per attempt is 35x the observed worst case and still
+    // tolerates a slow cellular uplink. 2 attempts x 4s = 8s worst case.
+    DWORD tmo = 4000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&tmo), sizeof(tmo));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
@@ -159,31 +220,78 @@ bool ExpSocks5Precheck(const std::string& phone_ip, uint16_t phone_port,
 
 SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
                            const ExpAuth& auth, uint32_t dst_ip_net,
-                           uint16_t dst_port_net, std::string* err) {
-    SOCKET s = DialWithTimeout(phone_ip, phone_port, 3000, err);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+                           uint16_t dst_port_net, std::string* err,
+                           ExpSocks5Timing* timing,
+                           uint32_t* local_ip_net) {
+    auto t0 = std::chrono::steady_clock::now();
+    auto stage_ms = [&](std::chrono::steady_clock::time_point since) {
+        return static_cast<int>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - since)
+            .count());
+    };
+    int tcp_ms = 0;
+    SOCKET s = DialWithTimeout(phone_ip, phone_port, 3000, err, &tcp_ms,
+                                local_ip_net);
+    if (s == INVALID_SOCKET) {
+        if (timing) {
+            timing->tcp_ms = tcp_ms;
+            timing->total_ms = tcp_ms;
+        }
+        return INVALID_SOCKET;
+    }
+    auto t_auth = std::chrono::steady_clock::now();
     if (!HandshakeAuth(s, auth, err)) {
+        if (timing) {
+            timing->tcp_ms = tcp_ms;
+            timing->auth_ms = stage_ms(t_auth);
+            timing->total_ms = stage_ms(t0);
+        }
         closesocket(s);
         return INVALID_SOCKET;
     }
+    int auth_ms = stage_ms(t_auth);
+    auto t_conn = std::chrono::steady_clock::now();
     // CONNECT request: VER CMD=CONNECT RSV=0 ATYP=IPv4 DST.ADDR DST.PORT
     uint8_t req[10] = {0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0};
     std::memcpy(req + 4, &dst_ip_net, 4);
     std::memcpy(req + 8, &dst_port_net, 2);
     if (!SendAll(s, req, sizeof(req))) {
-        if (err) *err = "CONNECT send failed";
+        if (err) *err = "CONNECT_SEND_FAILED";
+        if (timing) {
+            timing->tcp_ms = tcp_ms;
+            timing->auth_ms = auth_ms;
+            timing->total_ms = stage_ms(t0);
+        }
         closesocket(s);
         return INVALID_SOCKET;
     }
     uint8_t head[4];
     if (!RecvAll(s, head, 4)) {
-        if (err) *err = "CONNECT reply missing";
+        // The phone ACCEPTED the TCP connection but never answered CONNECT.
+        // That is the field log's "CONNECT reply missing" — a saturated
+        // phone thread pool, NOT a routing problem. Say so explicitly.
+        int e = WSAGetLastError();
+        if (err) *err = "CONNECT_REPLY_MISSING (WSA " + std::to_string(e) +
+                        ", " + std::to_string(stage_ms(t_conn)) + "ms)";
+        if (timing) {
+            timing->tcp_ms = tcp_ms;
+            timing->auth_ms = auth_ms;
+            timing->connect_ms = stage_ms(t_conn);
+            timing->total_ms = stage_ms(t0);
+        }
         closesocket(s);
         return INVALID_SOCKET;
     }
     if (head[0] != 0x05 || head[1] != 0x00) {
         // 0x01 fault, 0x02 not allowed, 0x03 net unreachable, 0x05 refused...
-        if (err) *err = "CONNECT rejected (REP=0x" + std::to_string(head[1]) + ")";
+        if (err) *err = "CONNECT_REJECTED (REP=0x" + std::to_string(head[1]) +
+                        ")";
+        if (timing) {
+            timing->tcp_ms = tcp_ms;
+            timing->auth_ms = auth_ms;
+            timing->connect_ms = stage_ms(t_conn);
+            timing->total_ms = stage_ms(t0);
+        }
         closesocket(s);
         return INVALID_SOCKET;
     }
@@ -202,6 +310,12 @@ SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
     } else {
         closesocket(s);
         return INVALID_SOCKET;
+    }
+    if (timing) {
+        timing->tcp_ms = tcp_ms;
+        timing->auth_ms = auth_ms;
+        timing->connect_ms = stage_ms(t_conn);
+        timing->total_ms = stage_ms(t0);
     }
     return s;
 }
