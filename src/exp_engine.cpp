@@ -348,7 +348,13 @@ void Pump(TcpSession* s, int from) {
     SOCKET dst = from == 0 ? b : a;
     if (src == INVALID_SOCKET || dst == INVALID_SOCKET) return;
     auto* counter = from == 0 ? &s->up : &s->down;
-    char buf[16384];
+    // ProxyBridge pb_relay.c:760 runs 128 KB per-direction buffers; our old
+    // 16 KB copy buffer throttled the download path — over Wi-Fi Direct the
+    // bandwidth-delay product easily exceeds 16 KB, so the pump spent most
+    // of its time waiting for the receive window instead of moving data
+    // (field symptom: tiny ↓byte counts while connections stay open).
+    // thread_local keeps 128 KB out of the thread stack.
+    static thread_local char buf[131072];
     int reason = kCloseNone;
     int wsaerr = 0;
     for (;;) {
@@ -437,9 +443,16 @@ struct ConnectGate {
     std::mutex m;
     std::condition_variable cv;
     int cur = 0;
-    int cap = 8;
-    int min_cap = 4;   // never collapse to 2 (field log: cap 2 => deadlock)
-    int max_cap = 12;
+    // beta0.1.9: the 0.1.8 field screenshots show CONNECT latencies of
+    // 53ms / 90ms / 110ms but ALSO 3064ms and 3070ms with 排队 0ms on the PC
+    // side. The queue the burst lands in is on the PHONE, not here: the PC
+    // gate now admits 8 concurrent handshakes and the phone's Kotlin
+    // ProxyServer serialises them. beta0.1.6 already measured that the same
+    // phone answers in 40-90ms when the PC keeps the handshake concurrency
+    // low. Start conservative; AIMD can still climb when the phone keeps up.
+    int cap = 4;
+    int min_cap = 3;   // never collapse to 2 (field log: cap 2 => deadlock)
+    int max_cap = 8;
     bool adaptive = true;
     int success_streak = 0;
     // Saturation evidence inside a rolling window.
@@ -530,7 +543,10 @@ struct ConnectGate {
         std::lock_guard<std::mutex> lk(m);
         if (fixed_cap > 0) {
             adaptive = false;
-            cap = std::min(max_cap, std::max(min_cap, fixed_cap));
+            // Only the deadlock floor is enforced; an explicit user override
+            // (exp_policy.ini ConnectConcurrency, the 4/8/12 experiment) may
+            // exceed max_cap on purpose.
+            cap = std::max(min_cap, fixed_cap);
         }
         cv.notify_all();
     }

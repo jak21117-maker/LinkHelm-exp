@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.1.8 — MINIMAL end-to-end self-test.
+// LinkHelm-exp beta0.1.9 — MINIMAL end-to-end self-test.
 //
 // Design rule (per review): no pure-function / mock / self-attesting asserts.
 // Every Check() below crosses a REAL socket boundary against an in-process
@@ -54,6 +54,7 @@ static bool RecvAllT(SOCKET s, void* p, int n) {
 
 // ------------------------------------------------------------ mock phone
 static const uint16_t kPhonePort = 18080;
+static const uint16_t kEchoPort = 19099;   // mock-phone byte-exact echo
 static std::atomic<bool> g_phone_on{true};
 
 static std::vector<uint8_t> MockDnsAnswer(const uint8_t* q, int n) {
@@ -167,6 +168,23 @@ static void PhoneConn(SOCKET c) {
     if (ntohs(dport) == 1) {
         uint8_t rep[10] = {5, 5, 0, 1, 0, 0, 0, 0, 0, 0};
         SendAllT(c, rep, 10);
+        closesocket(c);
+        return;
+    }
+    // Deterministic byte-exact echo on kEchoPort. The bulk-loopback test
+    // pushes a large pseudo-random stream through engine Pump() both ways
+    // and compares hashes — the A/B/C/D four-node closed-loop the review
+    // demanded (app -> relay -> phone -> relay -> app, byte counts AND
+    // content, not just a CONNECT verdict).
+    if (ntohs(dport) == kEchoPort) {
+        uint8_t ok[10] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
+        if (!SendAllT(c, ok, 10)) { closesocket(c); return; }
+        static char eb[65536];
+        for (;;) {
+            int n = recv(c, eb, sizeof(eb), 0);
+            if (n <= 0) break;
+            if (!SendAllT(c, eb, n)) break;
+        }
         closesocket(c);
         return;
     }
@@ -340,6 +358,104 @@ static std::string RunSession(uint16_t dst_port, uint32_t dst_ip,
     return result;
 }
 
+// Four-node closed-loop evidence (review §04): push `total` pseudo-random
+// bytes app -> engine Pump -> mock phone -> engine Pump -> app and compare
+// length AND FNV-1a content hash. A/B and C/D are the two pump directions;
+// the CONNECT verdict alone (B "手机已接通") proves nothing about C/D, which
+// is exactly where the 0.1.8 field run collapsed (↓5.3KB across 18 flows).
+static bool RunBulkLoopback(size_t total, const ExpAuth& auth,
+                            uint64_t* sent_hash_out,
+                            uint64_t* recv_hash_out, size_t* recv_len_out,
+                            uint64_t* ms_out) {
+    SOCKET ln = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in la{}; la.sin_family = AF_INET;
+    la.sin_addr.s_addr = inet_addr("127.0.0.1"); la.sin_port = 0;
+    bind(ln, (sockaddr*)&la, sizeof(la));
+    listen(ln, 4);
+    sockaddr_in got{}; int gl = sizeof(got);
+    getsockname(ln, (sockaddr*)&got, &gl);
+    SOCKET app = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    bool ok = connect(app, (sockaddr*)&got, sizeof(got)) != SOCKET_ERROR;
+    SOCKET accepted = INVALID_SOCKET;
+    if (ok) {
+        accepted = accept(ln, nullptr, nullptr);
+        if (accepted == INVALID_SOCKET) ok = false;
+    }
+    if (ok) {
+        auto sess = std::make_shared<TcpSession>();
+        sess->client.store(accepted);
+        static std::atomic<int> bulk_budget{0};
+        static TcpRegistry bulk_reg;
+        static ConnectGate bulk_gate;
+        static std::atomic<bool> bulk_stop{true};
+        static auto bulk_stats = std::make_shared<EngineStats>();
+        static auto bulk_log = [](const std::wstring&) {};
+        sess->budget = &bulk_budget;
+        bulk_budget.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk(bulk_reg.mtx);
+            bulk_reg.live.push_back(sess);
+        }
+        NatEntry ne{};
+        ne.orig_dst_ip = 0x7F000001;           // 127.0.0.1 host order
+        ne.orig_dst_port = kEchoPort;
+        ne.app_ip = inet_addr("127.0.0.1");
+        ne.flow_id = 78;
+        std::thread(TcpWorker, sess, ne, std::string("127.0.0.1"),
+                    kPhonePort, auth, (uint64_t)78, bulk_log,
+                    &bulk_reg, bulk_stats, &bulk_gate, &bulk_stop,
+                    &bulk_budget).detach();
+
+        auto t0 = std::chrono::steady_clock::now();
+        uint32_t rng = 0x12345678u;
+        uint64_t hs = 1469598103934665603ull;  // FNV-1a 64 offset basis
+        std::vector<char> chunk(65536);
+        size_t left = total;
+        while (left > 0) {
+            size_t n = left < chunk.size() ? left : chunk.size();
+            for (size_t i = 0; i < n; ++i) {
+                rng = rng * 1664525u + 1013904223u;
+                chunk[i] = (char)(rng >> 24);
+                hs ^= (uint8_t)chunk[i];
+                hs *= 1099511628211ull;
+            }
+            if (!SendAllT(app, chunk.data(), (int)n)) { ok = false; break; }
+            left -= n;
+        }
+        // Half-close the upload so the echo terminates: this exercises the
+        // pump's clean-EOF propagation (shutdown SD_SEND) end to end.
+        shutdown(app, SD_SEND);
+        uint64_t hr = 1469598103934665603ull;
+        size_t got_len = 0;
+        if (ok) {
+            char rb[65536];
+            for (;;) {
+                int n = recv(app, rb, sizeof(rb), 0);
+                if (n == 0) break;
+                if (n < 0) { ok = false; break; }
+                for (int i = 0; i < n; ++i) {
+                    hr ^= (uint8_t)rb[i];
+                    hr *= 1099511628211ull;
+                }
+                got_len += (size_t)n;
+            }
+        }
+        *ms_out = (uint64_t)std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        *sent_hash_out = hs;
+        *recv_hash_out = hr;
+        *recv_len_out = got_len;
+        closesocket(app);
+        for (int i = 0; i < 60 && bulk_budget.load() > 0; ++i) Sleep(50);
+        if (bulk_budget.load() != 0) ok = false;
+    } else {
+        closesocket(app);
+    }
+    closesocket(ln);
+    return ok;
+}
+
 // ------------------------------------------------------------------ main
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -353,7 +469,7 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.1.8 end-to-end self-test ===\n");
+    std::printf("=== LinkHelm-exp beta0.1.9 end-to-end self-test ===\n");
     std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
                 "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 
@@ -574,7 +690,7 @@ int main(int argc, char** argv) {
                           std::to_string(excl_imp) + " phone=" +
                           std::to_string(excl_phone));
 
-                // beta0.1.8 (§06): DNS to the PHONE must be captured so the
+                // beta0.1.9 (§06): DNS to the PHONE must be captured so the
                 // "WinDivert intercepts DNS" fallback is reachable. The old
                 // filter excluded the whole phone IP, which made that
                 // fallback unreachable by construction -> NCSI flickered.
@@ -595,7 +711,7 @@ int main(int argc, char** argv) {
                       "phone_dns=" + std::to_string(cap_phone_dns) +
                           " phone_socks=" + std::to_string(excl_phone_socks));
 
-                // beta0.1.8 (§05): a PUBLIC service on port 8080 must be
+                // beta0.1.9 (§05): a PUBLIC service on port 8080 must be
                 // captured. The old code bypassed ANY port-8080 traffic
                 // (including public :8080), which sent it out through the
                 // native route — an unproxied egress, i.e. "public IP
@@ -628,10 +744,10 @@ int main(int argc, char** argv) {
         Check(g.Cap() == cap0,
               "gate: ONE saturation event does NOT halve the cap",
               "cap " + std::to_string(g.Cap()));
-        // Repeated refusals inside the window DO downgrade, but never below 4.
+        // Repeated refusals inside the window DO downgrade, but never below 3.
         for (int i = 0; i < 6; ++i) g.ReportOutcome(true, false, 300);
-        Check(g.Cap() >= 4,
-              "gate: repeated saturation downgrades but never below 4",
+        Check(g.Cap() >= 3 && g.Cap() <= 4,
+              "gate: repeated saturation downgrades but never below 3",
               "cap " + std::to_string(g.Cap()));
         // A fixed policy disables adaptation entirely (report §03 A/B test).
         ConnectGate g2;
@@ -656,6 +772,27 @@ int main(int argc, char** argv) {
               "SOCKS5 dial: refused connection is classified, not 'timeout'",
               err);
         if (s != INVALID_SOCKET) closesocket(s);
+    }
+
+    // 11. Four-node byte-exact closed loop (review §04). A CONNECT verdict
+    //     ("手机已接通") proves nothing about the data path: the 0.1.8 field
+    //     run recorded 18 successful CONNECTs but only ↓5.3KB of payload.
+    //     1 KB checks correctness; 1 MB checks throughput (128 KB pump
+    //     buffer) and clean half-close teardown in BOTH directions.
+    {
+        for (size_t total : {static_cast<size_t>(1024),
+                             static_cast<size_t>(1024 * 1024)}) {
+            uint64_t hs = 0, hr = 0, ms = 0;
+            size_t got = 0;
+            bool done = RunBulkLoopback(total, auth, &hs, &hr, &got, &ms);
+            std::string name = "bulk loopback " + std::to_string(total) +
+                               "B: app->pump->phone->pump->app byte-exact";
+            Check(done && got == total && hs == hr, name.c_str(),
+                  "sent=" + std::to_string(total) + " recv=" +
+                      std::to_string(got) + " hash_match=" +
+                      std::to_string(hs == hr) + " " + std::to_string(ms) +
+                      "ms");
+        }
     }
 
     std::printf("\n=== RESULT: %d passed, %d failed ===\n",

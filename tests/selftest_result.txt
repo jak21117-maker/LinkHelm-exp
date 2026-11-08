@@ -1,4 +1,4 @@
-=== LinkHelm-exp beta0.1.8 end-to-end self-test ===
+=== LinkHelm-exp beta0.1.9 end-to-end self-test ===
 NOTE: driver-layer capture/reinject is NOT covered here. Use tests/driver_probe.exe as Administrator on the target PC.
 
 [PASS] SOCKS5 RFC1929 handshake (accept + reject)                / username/password rejected by phone
@@ -7,16 +7,18 @@ NOTE: driver-layer capture/reinject is NOT covered here. Use tests/driver_probe.
 [PASS] AAAA suppressed (NOERROR + empty answer)                 len=33
 [PASS] UDP survives malformed relay packets + restores endpoint echo=PING-EXP
 [PASS] TcpWorker: HTTP round trip + clean session teardown      HTTP/1.0 200 OK finalized=yes
-[PASS] CONNECT failure -> immediate app-side RST                err=10054 28ms
+[PASS] CONNECT failure -> immediate app-side RST                err=10054 1ms
 [PASS] relay socket: Nagle off, timeouts cleared, keepalive on  nodelay=1 keepalive=1 rcvtimeo=0
 [PASS] product BuildCaptureFilter() compiles                    (outbound and !loopback and !impostor and ip.DstAddr != 192.168.49.1 and (tcp or udp)) or (outbound and !loopback and !impostor and ip.DstAddr == 192.168.49.1 and udp.DstPort == 53) or (outbound and !loopback and !impostor and ipv6) or (tcp.SrcPort == 7712 and !impostor)
 [PASS] filter captures IPv4+IPv6, excludes impostor+phone       v4=1 v6=1 impostor=1 phone=1
 [PASS] filter: phone UDP/53 captured (DNS fallback reachable), phone TCP/SOCKS5 excluded (no proxy loop) phone_dns=1 phone_socks=1
 [PASS] filter: public :8080 IS captured (not bypassed by port)  1
-[PASS] gate: a recovered flow does NOT lower the concurrency cap cap 8 -> 8
-[PASS] gate: ONE saturation event does NOT halve the cap        cap 8
-[PASS] gate: repeated saturation downgrades but never below 4   cap 4
+[PASS] gate: a recovered flow does NOT lower the concurrency cap cap 4 -> 4
+[PASS] gate: ONE saturation event does NOT halve the cap        cap 4
+[PASS] gate: repeated saturation downgrades but never below 3   cap 3
 [PASS] gate: fixed policy disables adaptation                   cap 6
-[PASS] SOCKS5 dial: refused connection is classified, not 'timeout' TCP_CONNECT_FAILED (WSA 10061, 2054ms) to 127.0.0.1:1
+[PASS] SOCKS5 dial: refused connection is classified, not 'timeout' TCP_CONNECT_FAILED (WSA 10061, 2033ms) to 127.0.0.1:1
+[PASS] bulk loopback 1024B: app->pump->phone->pump->app byte-exact sent=1024 recv=1024 hash_match=1 14ms
+[PASS] bulk loopback 1048576B: app->pump->phone->pump->app byte-exact sent=1048576 recv=1048576 hash_match=1 2ms
 
-=== RESULT: 17 passed, 0 failed ===
+=== RESULT: 19 passed, 0 failed ===
