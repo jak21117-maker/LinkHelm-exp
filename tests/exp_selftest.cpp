@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.2.1 — MINIMAL end-to-end self-test.
+// LinkHelm-exp beta0.2.2 — MINIMAL end-to-end self-test.
 //
 // Design rule (per review): no pure-function / mock / self-attesting asserts.
 // Every Check() below crosses a REAL socket boundary against an in-process
@@ -467,7 +467,7 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.2.1 end-to-end self-test ===\n");
+    std::printf("=== LinkHelm-exp beta0.2.2 end-to-end self-test ===\n");
     std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
                 "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 
@@ -688,7 +688,7 @@ int main(int argc, char** argv) {
                           std::to_string(excl_imp) + " phone=" +
                           std::to_string(excl_phone));
 
-                // beta0.2.1 (§06): DNS to the PHONE must be captured so the
+                // beta0.2.2 (§06): DNS to the PHONE must be captured so the
                 // "WinDivert intercepts DNS" fallback is reachable. The old
                 // filter excluded the whole phone IP, which made that
                 // fallback unreachable by construction -> NCSI flickered.
@@ -709,7 +709,7 @@ int main(int argc, char** argv) {
                       "phone_dns=" + std::to_string(cap_phone_dns) +
                           " phone_socks=" + std::to_string(excl_phone_socks));
 
-                // beta0.2.1 (§05): a PUBLIC service on port 8080 must be
+                // beta0.2.2 (§05): a PUBLIC service on port 8080 must be
                 // captured. The old code bypassed ANY port-8080 traffic
                 // (including public :8080), which sent it out through the
                 // native route — an unproxied egress, i.e. "public IP
@@ -725,7 +725,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 9. beta0.2.1: the ConnectGate is GONE (ProxyBridge architecture — no
+    // 9. beta0.2.2: the ConnectGate is GONE (ProxyBridge architecture — no
     //    local admission queue). Its policy assertions died with it; the
     //    failure path is covered by test 10 (refusal classification) and
     //    the RST-on-failure behaviour of TcpWorker itself.
@@ -768,7 +768,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 12. DNS positive cache (beta0.2.1): a stored reply is served fresh
+    // 12. DNS positive cache (beta0.2.2): a stored reply is served fresh
     //     with the NEW query's transaction ID, negative replies (RCODE!=0)
     //     are never cached, and malformed queries are ignored safely.
     {

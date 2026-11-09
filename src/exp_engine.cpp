@@ -23,6 +23,7 @@
 #include <cwctype>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -295,6 +296,11 @@ struct TcpSession {
     std::atomic<uint64_t> down{0};   // phone -> app bytes
     // Which side closed first. -1 = still open, 0 = app, 1 = phone.
     std::atomic<int> first_eof{-1};
+    // beta0.2.2: the NAT mapping's owner. ExpireLoop must never erase a
+    // mapping whose relay session is still alive (ProxyBridge pb_conntrack
+    // keeps conntrack entries for the lifetime of the CONNECTION, not a
+    // fixed idle clock). Set by AcceptLoop at accept time.
+    uint64_t flow_id = 0;
     void NoteEof(int who) {
         int expected = -1;
         first_eof.compare_exchange_strong(expected, who);
@@ -505,6 +511,9 @@ struct EngineStats {
     // mapping generation is stable across retransmissions.
     std::atomic<uint64_t> nat_syn_retransmit{0};
     std::atomic<uint64_t> nat_fin_retire{0};
+    // beta0.2.2: listener packets whose mapping vanished — dropped instead
+    // of being injected to the real server (was a direct-egress leak).
+    std::atomic<uint64_t> nat_orphan_drop{0};
     // ProxyBridge is_proxy_server_endpoint / is_proxy_udp_endpoint: the
     // relay's OWN traffic must never re-enter the redirector.
     std::atomic<uint64_t> endpoint_bypass{0};
@@ -1817,6 +1826,7 @@ void ExpEngine::Impl::AcceptLoop() {
         auto s = std::make_shared<TcpSession>();
         s->client.store(cs);
         s->budget = &tcp_budget;
+        s->flow_id = entry.flow_id;   // beta0.2.2: NAT-mapping ownership
         uint64_t flow_id = entry.flow_id;
         {
             std::lock_guard<std::mutex> lk(tcp_reg.mtx);
@@ -1903,22 +1913,42 @@ void ExpEngine::Impl::ExpireLoop() {
         if (!running.load()) break;
         ++ticks;
         auto now = std::chrono::steady_clock::now();
+        // beta0.2.2: flow ids whose relay session is STILL ALIVE. Their NAT
+        // mappings must never be erased by the idle clock: ProxyBridge
+        // pb_conntrack keeps a conntrack entry for the lifetime of the
+        // CONNECTION it backs, not for "30 seconds without packets".
+        // The beta0.2.1 field log proved the 30s idle erase was killing
+        // live browser keep-alive connections: the audit reported
+        // "未代理 5-7" with EXACTLY the targets of the 91-second proxied
+        // flows, 87 packets were dropped fail-closed (their sockets stayed
+        // ESTABLISHED but the next request found no mapping), and the
+        // browser then killed the hung connections ("应用侧先关闭" — the
+        // intermittent-connectivity symptom).
+        std::set<uint64_t> live_flows;
+        {
+            std::lock_guard<std::mutex> lk(tcp_reg.mtx);
+            for (auto& sp : tcp_reg.live)
+                live_flows.insert(sp->flow_id);
+        }
         {
             std::lock_guard<std::mutex> lk(nat_mtx);
             for (auto it = nat.begin(); it != nat.end();) {
                 // ProxyBridge cleanup_worker: a mapping whose flow is gone
                 // must not survive until the ephemeral port is recycled.
                 // `last` is refreshed by EVERY packet of a live flow, so 30s
-                // of silence is safe even for idle HTTPS keep-alives (which
-                // send keep-alive probes / ACKs). FIN-marked entries retire
-                // after 5s (ProxyBridge connection_fin).
+                // of silence is safe for mappings WITHOUT a live session.
+                // FIN-marked entries retire after 5s (ProxyBridge
+                // connection_fin) — but only once their session is gone too.
                 auto age = std::chrono::duration_cast<std::chrono::seconds>(
                     now - it->second.last).count();
                 bool retired = it->second.retire_at !=
                     std::chrono::steady_clock::time_point::max() &&
                     now >= it->second.retire_at;
-                if (age > 30 || retired) it = nat.erase(it);
-                else ++it;
+                if ((age > 30 || retired) &&
+                        !live_flows.count(it->second.flow_id))
+                    it = nat.erase(it);
+                else
+                    ++it;
             }
         }
         std::vector<std::shared_ptr<UdpSession>> dead;
@@ -2000,6 +2030,7 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" | SYN 重置 " + std::to_wstring(stats->nat_syn_reset.load()) +
                 L" SYN重传 " + std::to_wstring(stats->nat_syn_retransmit.load()) +
                 L" FIN/RST 退休 " + std::to_wstring(stats->nat_fin_retire.load()) +
+                L" 孤儿丢弃 " + std::to_wstring(stats->nat_orphan_drop.load()) +
                 L" 代理端点放行 " + std::to_wstring(stats->endpoint_bypass.load()) +
                 L" | 阻断 " + std::to_wstring(stats->blocked.load()) +
                 L" | DNS状态 " +
@@ -2190,9 +2221,21 @@ void ExpEngine::Impl::MainLoop() {
                 std::lock_guard<std::mutex> lk(nat_mtx);
                 auto it = nat.find(key);
                 if (it == nat.end()) {
-                    stats->blocked.fetch_add(1);  // stray loopback packet
-                    WdInject(divert, wd, pkt.data(), len, &addr, L"回环无表项",
-                             0, stats, log);
+                    // beta0.2.2: DROP, never inject. This packet is
+                    // addressed to the REAL server ({orig_ip, orig_port})
+                    // and used to be injected UNMODIFIED outbound whenever
+                    // its mapping was already gone — leaking a direct,
+                    // unproxied connection out of the WLAN interface and
+                    // provoking a server RST back into the relay socket
+                    // (field log: err=10053 writes, 阻断 counter growth).
+                    // Fail-closed is always safe: TCP retransmits recover,
+                    // and with the ExpireLoop fix above a live session can
+                    // no longer lose its mapping in the first place.
+                    uint64_t n = stats->nat_orphan_drop.fetch_add(1) + 1;
+                    if (n <= 3)
+                        log(L"[exp] 孤儿反射包丢弃（映射已消失）" +
+                            IpW(dst_ip) + L":" +
+                            std::to_wstring(ntohs(dport)));
                     continue;
                 }
                 it->second.last = std::chrono::steady_clock::now();
