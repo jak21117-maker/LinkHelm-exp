@@ -144,6 +144,36 @@ UDP/53 会被捕获」（DNS 兜底路径可达 —— 直接对应 Wi-Fi 的 In
 
 ## Changelog
 
+### beta0.2.3 — 本地 DNS 接收线程存活加固 + 上游失败可观测（按诊断建议的最小修改范围）
+
+数据源 = beta0.2.2 真机对照测试：透明 HTTPS curl(28) 5004ms、显式 SOCKS5
+curl(28) 5007ms、`Resolve-DnsName` 报 10054。结论：手机 SOCKS5 底层可达性与
+本地 DNS 接收线程是两处独立故障；本轮**只改 DNS，TCP NAT / WinDivert 反射 /
+UDP ASSOCIATE / APK 一律不动**。
+
+**根因预防 — SIO_UDP_CONNRESET 关闭**：Windows UDP socket 会把更早一次
+sendto 收到的 ICMP 端口不可达（回包送达时客户端临时端口已关闭）转成
+`WSAECONNRESET (10054)` 在**下一次 recvfrom** 上报出。socket 创建后立即用
+`WSAIoctl(SIO_UDP_CONNRESET, FALSE)` 关闭该行为（MinGW sysroot 缺该宏时本地
+定义，同 SIO_KEEPALIVE_VALS 处理）。
+
+**容错分支（第二道防线）**：`DnsProxyLoop` 原 `n <= 0 → break` 会让 10054
+直接杀死接收线程——端口 53 仍绑定但无人应答，全机解析超时（"53 端口有人监听
+但解析超时"的源码级解释）。现 10054/10060 计数 `环回重置` + 限频日志（3s）
+后继续；其余致命错误计数 `接收致命错` 并带错误码退出（不再静默）。零长度
+数据报忽略。
+
+**上游失败分类（`DnsQueryWorker`）**：原来失败只进笼统的 `DNS 失败`。现分
+三类计数并入统计行：`DNS 上游连不上`（CONNECT 失败，日志带 ExpSocks5 错误
+串，区分手机不可达 vs 解析器超时）、`发送失败`、`接收失败`（均带 WSA 错误码
+与池化/新拨链路标注）。日志限频 3s，防止手机断开时 detached worker 刷屏。
+
+统计行新增：`环回重置 / 接收致命错 / DNS 上游连不上 / 发送失败 / 接收失败`；
+ENGINE_STOP 最终统计同步加入 DNS 六项。
+
+自测 17/17 PASS（beta0.2.3）。真机判据不变：管理员 driver_probe；DNS 接收
+线程存活可通过统计行 `环回重置>0 且 DNS 成功持续增长` 验证。
+
 ### beta0.2.2 — NAT 映射生命周期绑定活连接（真机 beta0.2.1 日志实锤的两处引擎缺陷）
 
 数据源 = beta0.2.1 真机 `linkhelm.log` 309 行。数据面已被证明端到端可用：

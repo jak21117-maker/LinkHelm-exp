@@ -40,6 +40,12 @@
 #ifndef SIO_KEEPALIVE_VALS
 #define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
 #endif
+// beta0.2.3: same MinGW-sysroot caveat as SIO_KEEPALIVE_VALS. Disabling
+// this behaviour stops Windows from converting an ICMP port-unreachable
+// for an earlier UDP reply into WSAECONNRESET on the next recvfrom.
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 struct TcpKeepaliveVals {
     ULONG onoff;
     ULONG keepalivetime;
@@ -296,7 +302,7 @@ struct TcpSession {
     std::atomic<uint64_t> down{0};   // phone -> app bytes
     // Which side closed first. -1 = still open, 0 = app, 1 = phone.
     std::atomic<int> first_eof{-1};
-    // beta0.2.2: the NAT mapping's owner. ExpireLoop must never erase a
+    // beta0.2.3: the NAT mapping's owner. ExpireLoop must never erase a
     // mapping whose relay session is still alive (ProxyBridge pb_conntrack
     // keeps conntrack entries for the lifetime of the CONNECTION, not a
     // fixed idle clock). Set by AcceptLoop at accept time.
@@ -496,6 +502,20 @@ struct EngineStats {
     // The first reuse then fails; we redial once and retry the query.
     std::atomic<uint64_t> dns_pool_reuse_fail{0};
     std::atomic<uint64_t> dns_pool_redial_ok{0};
+    // beta0.2.3: the loopback DNS receive thread used to DIE on
+    // WSAECONNRESET (10054): Windows reports an ICMP port-unreachable for
+    // an EARLIER reply (client port vanished) on the NEXT recvfrom, so the
+    // loop exited while port 53 stayed bound — every resolution on the
+    // machine then timed out until restart. These counters make that
+    // failure mode observable; the loop itself now survives it.
+    std::atomic<uint64_t> dns_loop_reset{0};   // 10054/10060 tolerated
+    std::atomic<uint64_t> dns_loop_fatal{0};   // loop exited, err logged
+    // beta0.2.3: WHERE the upstream leg failed — phone CONNECT / send /
+    // recv. DNS 失败 alone could not distinguish a dead phone link from a
+    // resolver that answered slowly.
+    std::atomic<uint64_t> dns_up_connect_fail{0};
+    std::atomic<uint64_t> dns_up_send_fail{0};
+    std::atomic<uint64_t> dns_up_recv_fail{0};
     // Plan §4.5: UDP:443 is NOT unconditionally dropped any more; it is
     // offered to UDP ASSOCIATE like any other datagram. Count what happens
     // so a game's QUIC traffic is observable instead of vanishing silently.
@@ -511,7 +531,7 @@ struct EngineStats {
     // mapping generation is stable across retransmissions.
     std::atomic<uint64_t> nat_syn_retransmit{0};
     std::atomic<uint64_t> nat_fin_retire{0};
-    // beta0.2.2: listener packets whose mapping vanished — dropped instead
+    // beta0.2.3: listener packets whose mapping vanished — dropped instead
     // of being injected to the real server (was a direct-egress leak).
     std::atomic<uint64_t> nat_orphan_drop{0};
     // ProxyBridge is_proxy_server_endpoint / is_proxy_udp_endpoint: the
@@ -875,6 +895,9 @@ struct DnsProxy {
     // beta0.2.1: positive cache — most lookups never leave the PC, and a
     // phone-side hiccup no longer makes every resolution fail at once.
     DnsCache cache;
+    // beta0.2.3: rate limiter for upstream-failure logs. Worker threads are
+    // detached, so a dead phone would otherwise flood the UI log.
+    std::atomic<int64_t> last_upstream_log_ms{0};
 };
 
 void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
@@ -882,6 +905,15 @@ void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
                     const ExpAuth& auth, std::shared_ptr<EngineStats> stats,
                     const std::function<void(const std::wstring&)>& log) {
     p->budget.fetch_add(1);
+    // beta0.2.3: rate-limited upstream-failure log (max 1 / 3s across ALL
+    // detached workers — CAS decides the single winner).
+    auto log_upstream = [&](const std::wstring& msg) {
+        int64_t now = DnsCacheNowMs();
+        int64_t last = p->last_upstream_log_ms.load(std::memory_order_relaxed);
+        if (now - last < 3000) return;
+        if (!p->last_upstream_log_ms.compare_exchange_strong(last, now)) return;
+        log(msg);
+    };
     bool ok = false;
     if (query.size() >= 12 && query.size() <= 4096) {
         // beta0.2.1: fresh cache hit answers without touching the phone.
@@ -931,31 +963,58 @@ void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
                     }
                 }
             }
-            if (s == INVALID_SOCKET) break;  // both upstreams unreachable
+            if (s == INVALID_SOCKET) {
+                // beta0.2.3: name the failure instead of a bare DNS 失败 —
+                // distinguishes phone-unreachable from resolver-timeout.
+                stats->dns_up_connect_fail.fetch_add(1);
+                log_upstream(L"[exp] DNS 上游 CONNECT 失败（两条上游均不可达）: " +
+                             FromUtf8(err));
+                break;
+            }
 
             DWORD tmo = 5000;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
                        reinterpret_cast<const char*>(&tmo), sizeof(tmo));
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
                        reinterpret_cast<const char*>(&tmo), sizeof(tmo));
-            bool link_failed = !SendAllRaw(s, req.data(), (int)req.size());
             std::vector<uint8_t> reply;
-            if (!link_failed) {
+            int fail_stage = 0;   // 1 = send, 2 = recv
+            int fail_err = 0;
+            bool link_failed = false;
+            if (!SendAllRaw(s, req.data(), (int)req.size())) {
+                link_failed = true;
+                fail_stage = 1;
+                fail_err = WSAGetLastError();
+            } else {
                 uint8_t lenb[2];
                 if (!RecvAllRaw(s, lenb, 2)) {
                     link_failed = true;
+                    fail_stage = 2;
+                    fail_err = WSAGetLastError();
                 } else {
                     int rlen = (lenb[0] << 8) | lenb[1];
-                    if (rlen <= 0 || rlen > 65535) link_failed = true;
-                    else {
+                    if (rlen <= 0 || rlen > 65535) {
+                        link_failed = true;
+                        fail_stage = 2;
+                    } else {
                         reply.resize((size_t)rlen);
-                        if (!RecvAllRaw(s, reply.data(), rlen))
+                        if (!RecvAllRaw(s, reply.data(), rlen)) {
                             link_failed = true;
+                            fail_stage = 2;
+                            fail_err = WSAGetLastError();
+                        }
                     }
                 }
             }
             if (link_failed) {
+                if (fail_stage == 1) stats->dns_up_send_fail.fetch_add(1);
+                else stats->dns_up_recv_fail.fetch_add(1);
                 if (from_pool) stats->dns_pool_reuse_fail.fetch_add(1);
+                log_upstream(std::wstring(L"[exp] DNS 上游") +
+                             (fail_stage == 1 ? L"发送" : L"接收") +
+                             L"失败 err=" + std::to_wstring(fail_err) +
+                             L"（" + (from_pool ? L"池化链路" : L"新拨链路") +
+                             L"）— 关闭重试");
                 closesocket(s);
                 continue;  // retry once with a fresh link
             }
@@ -998,18 +1057,42 @@ void DnsProxyLoop(DnsProxy* p, const std::string& phone8, uint16_t phone_port,
                   const ExpAuth& auth, std::shared_ptr<EngineStats> stats,
                   const std::function<void(const std::wstring&)>& log) {
     uint8_t buf[65535];
+    int64_t last_reset_log_ms = 0;
     while (p->running.load()) {
         sockaddr_in client{};
         int cl = sizeof(client);
         int n = recvfrom(p->sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
                          reinterpret_cast<sockaddr*>(&client), &cl);
-        if (n <= 0) {
-            if (p->running.load()) {
-                int e = WSAGetLastError();
-                if (e == WSAEWOULDBLOCK) continue;
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (!p->running.load()) break;
+            if (e == WSAEWOULDBLOCK) continue;
+            // beta0.2.3: WSAECONNRESET (10054) — Windows delivers the ICMP
+            // port-unreachable of an EARLIER reply (the client's ephemeral
+            // port closed between query and reply) as an error on the NEXT
+            // recvfrom. WSAETIMEDOUT (10060) is the same class. Both report
+            // a PAST datagram; they are never a reason to stop serving NEW
+            // queries. The old code broke out of the loop here: port 53
+            // stayed bound but nothing answered — every resolution on the
+            // machine timed out until restart (DNS 一会儿有一会儿没有).
+            if (e == WSAECONNRESET || e == WSAETIMEDOUT) {
+                stats->dns_loop_reset.fetch_add(1);
+                int64_t now = DnsCacheNowMs();
+                if (now - last_reset_log_ms >= 3000) {
+                    last_reset_log_ms = now;
+                    log(L"[exp] DNS 接收线程收到 UDP err=" +
+                        std::to_wstring(e) +
+                        L"（此前回包送往已关闭端口，忽略并继续）");
+                }
+                continue;
             }
+            stats->dns_loop_fatal.fetch_add(1);
+            log(L"[exp] DNS_DEGRADED: 接收线程致命错误 err=" +
+                std::to_wstring(e) + L" — 本地 DNS 接收停止，解析将超时");
             break;
         }
+        if (n <= 0) continue;  // zero-length datagram: nothing to answer
+
         // AAAA suppression BEFORE any SOCKS5 work: with no IPv6-capable
         // upstream, a NOERROR/empty answer stops the OS from opening IPv6
         // sockets that would otherwise be dropped or leak out natively.
@@ -1826,7 +1909,7 @@ void ExpEngine::Impl::AcceptLoop() {
         auto s = std::make_shared<TcpSession>();
         s->client.store(cs);
         s->budget = &tcp_budget;
-        s->flow_id = entry.flow_id;   // beta0.2.2: NAT-mapping ownership
+        s->flow_id = entry.flow_id;   // beta0.2.3: NAT-mapping ownership
         uint64_t flow_id = entry.flow_id;
         {
             std::lock_guard<std::mutex> lk(tcp_reg.mtx);
@@ -1913,7 +1996,7 @@ void ExpEngine::Impl::ExpireLoop() {
         if (!running.load()) break;
         ++ticks;
         auto now = std::chrono::steady_clock::now();
-        // beta0.2.2: flow ids whose relay session is STILL ALIVE. Their NAT
+        // beta0.2.3: flow ids whose relay session is STILL ALIVE. Their NAT
         // mappings must never be erased by the idle clock: ProxyBridge
         // pb_conntrack keeps a conntrack entry for the lifetime of the
         // CONNECTION it backs, not for "30 seconds without packets".
@@ -2012,6 +2095,12 @@ void ExpEngine::Impl::ExpireLoop() {
                 L" 重拨成功 " + std::to_wstring(stats->dns_pool_redial_ok.load()) +
                 L" 缓存命中 " + std::to_wstring(stats->dns_cache_hit.load()) +
                 L" 过期回源 " + std::to_wstring(stats->dns_stale_served.load()) +
+                L" 环回重置 " + std::to_wstring(stats->dns_loop_reset.load()) +
+                L" 接收致命错 " + std::to_wstring(stats->dns_loop_fatal.load()) +
+                L" | DNS 上游连不上 " +
+                std::to_wstring(stats->dns_up_connect_fail.load()) +
+                L" 发送失败 " + std::to_wstring(stats->dns_up_send_fail.load()) +
+                L" 接收失败 " + std::to_wstring(stats->dns_up_recv_fail.load()) +
                 L" | IPv6 阻断 " + std::to_wstring(stats->ipv6_drop.load()) +
                 L" | UDP 捕获 " + std::to_wstring(stats->udp_capture.load()) +
                 L" 局域网 " + std::to_wstring(stats->udp_lan_pass.load()) +
@@ -2221,7 +2310,7 @@ void ExpEngine::Impl::MainLoop() {
                 std::lock_guard<std::mutex> lk(nat_mtx);
                 auto it = nat.find(key);
                 if (it == nat.end()) {
-                    // beta0.2.2: DROP, never inject. This packet is
+                    // beta0.2.3: DROP, never inject. This packet is
                     // addressed to the REAL server ({orig_ip, orig_port})
                     // and used to be injected UNMODIFIED outbound whenever
                     // its mapping was already gone — leaking a direct,
@@ -2673,6 +2762,20 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     if (BackupAdapterDns(I->phone8, &I->dns_backup)) {
         I->dnsproxy.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (I->dnsproxy.sock != INVALID_SOCKET) {
+            // beta0.2.3 root fix: Windows UDP sockets report the ICMP
+            // port-unreachable of an EARLIER sendto (client port closed) as
+            // WSAECONNRESET on the NEXT recvfrom — that used to kill the
+            // receive loop while port 53 stayed bound. Disable the
+            // behaviour entirely; the loop's tolerant branch below is the
+            // second line of defence.
+            BOOL dis_connreset = FALSE;
+            if (WSAIoctl(I->dnsproxy.sock, SIO_UDP_CONNRESET,
+                         &dis_connreset, sizeof(dis_connreset), nullptr, 0,
+                         nullptr, nullptr, nullptr) == SOCKET_ERROR) {
+                I->log(L"[exp] DNS: SIO_UDP_CONNRESET 关闭失败 err=" +
+                       std::to_wstring(WSAGetLastError()) +
+                       L"（接收线程将依赖容错分支存活）");
+            }
             sockaddr_in la{};
             la.sin_family = AF_INET;
             la.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -2891,7 +2994,15 @@ void ExpEngine::Stop() {
            std::to_wstring(I->stats->inject_ok.load()) + L" / 回注失败 " +
            std::to_wstring(I->stats->inject_fail.load()) + L" / NAT 碰撞 " +
            std::to_wstring(I->stats->nat_collision.load()) + L" / 未代理泄漏 " +
-           std::to_wstring(I->stats->leak.load()));
+           std::to_wstring(I->stats->leak.load()) + L" / DNS 成功 " +
+           std::to_wstring(I->stats->dns_ok.load()) + L" 失败 " +
+           std::to_wstring(I->stats->dns_fail.load()) + L" / DNS 环回重置 " +
+           std::to_wstring(I->stats->dns_loop_reset.load()) + L" 接收致命错 " +
+           std::to_wstring(I->stats->dns_loop_fatal.load()) +
+           L" / DNS 上游连不上 " +
+           std::to_wstring(I->stats->dns_up_connect_fail.load()) +
+           L" 发送失败 " + std::to_wstring(I->stats->dns_up_send_fail.load()) +
+           L" 接收失败 " + std::to_wstring(I->stats->dns_up_recv_fail.load()));
     I->status(L"未连接");
 }
 
