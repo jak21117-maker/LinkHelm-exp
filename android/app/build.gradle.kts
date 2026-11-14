@@ -4,6 +4,8 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+import java.util.Properties
+
 android {
     namespace = "com.linkhelm.exp"
     compileSdk = 35
@@ -25,9 +27,31 @@ android {
         }
     }
 
+    signingConfigs {
+        // beta0.3.0: dedicated release keystore with a verifiable developer
+        // identity (CN=LinkHelm-exp, O=LinkHelm). Replaces the generic Android
+        // debug cert that triggered "developer identity unverified" on install.
+        // Credentials live in keystore.properties (gitignored) so the key
+        // password never lands in source control.
+        create("release") {
+            val propsFile = rootProject.file("keystore.properties")
+            if (propsFile.exists()) {
+                val props = Properties()
+                propsFile.inputStream().use { props.load(it) }
+                // keystore.properties lives at the project root, so resolve the
+                // store path against rootProject (not the :app module dir).
+                storeFile = rootProject.file(props.getProperty("STORE_FILE"))
+                storePassword = props.getProperty("STORE_PASSWORD")
+                keyAlias = props.getProperty("KEY_ALIAS")
+                keyPassword = props.getProperty("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
