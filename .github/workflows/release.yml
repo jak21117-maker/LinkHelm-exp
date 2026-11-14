@@ -37,7 +37,9 @@ jobs:
       # signing happens here with the same keystore as every main LinkHelm build.
       - name: Build release APK
         working-directory: android
-        run: ./gradlew assembleRelease --no-daemon
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
 
       - name: Sign APK (ci/debug.keystore — same identity as the main LinkHelm app)
         run: |
@@ -85,7 +87,8 @@ jobs:
         shell: msys2 {0}
         run: |
           ./build/exp_selftest.exe > selftest_output.txt
-          tail -1 selftest_output.txt
+          echo "selftest exit code: $?"
+          cat selftest_output.txt
           grep -q "17 passed, 0 failed" selftest_output.txt
 
       - name: Package win64 zip
