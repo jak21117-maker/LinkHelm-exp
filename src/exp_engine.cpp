@@ -636,14 +636,14 @@ struct ExpPolicy {
     // rows for healthy flows. Diagnostics are an OPT-IN switch, not the
     // default; abnormal flows are still always logged.
     bool flow_log = false;          // true = verbose per-flow lifecycle
-    int  stats_interval_s = 10;     // aggregate line cadence (seconds)
+    int  stats_interval_s = 30;     // aggregate line cadence (seconds)
 };
 
 // Single global read-only switch, published once from Start(). Every log
 // site consults it: no policy object has to be threaded through detached
 // workers (they must never touch Impl after Stop).
 static std::atomic<bool> g_flow_log{false};
-static std::atomic<int>  g_stats_interval_s{10};
+static std::atomic<int>  g_stats_interval_s{30};
 
 // beta0.3.1: one anomalous line per 30 s at most. The periodic stats row
 // already carries the complete counters, so a coarse global throttle only
@@ -685,7 +685,7 @@ ExpPolicy LoadPolicy() {
     p.firewall_allow = (_wcsicmp(buf, L"1") == 0);
     read(L"FlowLog", L"0");
     p.flow_log = (_wcsicmp(buf, L"1") == 0);
-    int si = GetPrivateProfileIntW(sec, L"StatsIntervalSec", 10,
+    int si = GetPrivateProfileIntW(sec, L"StatsIntervalSec", 30,
                                    path.c_str());
     if (si >= 5 && si <= 300) p.stats_interval_s = si;
     int c = GetPrivateProfileIntW(sec, L"ConnectConcurrency", 0,
@@ -1319,31 +1319,19 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     ExpSocks5Timing tm{};
     uint32_t local_ip = 0;
     SOCKET r = INVALID_SOCKET;
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (!stop->load()) break;
+    // beta0.4.0: single blocking dial, NO retry loop. The control-plane recv
+    // timeout is now 15 s (exp_socks5.cpp), matching the phone's 15 s upstream
+    // dial budget, so a slow-but-winnable dial is no longer RST at 6 s. A
+    // second attempt would only double a dead target's wait to ~30 s; the
+    // application's own SYN retransmission is the retry (same ISN keeps the
+    // NAT mapping, a fresh SYN starts a new flow), so the PC does not need to.
+    if (stop->load()) {
         err.clear();
         tm = ExpSocks5Timing{};
         r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
                                 htonl(entry.orig_dst_ip),
                                 htons(entry.orig_dst_port), &err, &tm,
                                 &local_ip);
-        if (r != INVALID_SOCKET) {
-            if (attempt > 0) {
-                stats->connect_retry_ok.fetch_add(1);
-                if (g_flow_log.load())
-                log(L"[exp] #" + std::to_wstring(flow_id) +
-                    L" CONNECT retry ok -> " + dstw);
-            }
-            break;
-        }
-        if (attempt == 0) {
-            stats->connect_retry.fetch_add(1);
-            bool transient =
-                err.find("CONNECT_REPLY_MISSING") != std::string::npos ||
-                err.find("SELECT_TIMEOUT") != std::string::npos;
-            if (!transient) break;   // refusal / send failure: final
-            Sleep(500);
-        }
     }
     int dial_ms = static_cast<int>(std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)

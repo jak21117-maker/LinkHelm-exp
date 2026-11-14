@@ -33,6 +33,6 @@ ConnectConcurrency=0
 ;   complete (60+ field) aggregate row for field diagnosis.
 FlowLog=0
 
-; Aggregate stats row cadence in seconds (5..300, default 10).
+; Aggregate stats row cadence in seconds (5..300, default 30).
 ; Higher values reduce log volume further without losing counters.
-StatsIntervalSec=10
+StatsIntervalSec=30

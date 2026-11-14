@@ -1,4 +1,4 @@
-// LinkHelm-exp beta0.3.1 — MINIMAL end-to-end self-test.
+// LinkHelm-exp beta0.4.0 — MINIMAL end-to-end self-test.
 //
 // Design rule (per review): no pure-function / mock / self-attesting asserts.
 // Every Check() below crosses a REAL socket boundary against an in-process
@@ -467,7 +467,7 @@ int main(int argc, char** argv) {
         for (;;) Sleep(1000);
     }
 
-    std::printf("=== LinkHelm-exp beta0.3.1 end-to-end self-test ===\n");
+    std::printf("=== LinkHelm-exp beta0.4.0 end-to-end self-test ===\n");
     std::printf("NOTE: driver-layer capture/reinject is NOT covered here. "
                 "Use tests/driver_probe.exe as Administrator on the target PC.\n\n");
 

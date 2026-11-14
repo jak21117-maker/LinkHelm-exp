@@ -4,8 +4,6 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-import java.util.Properties
-
 android {
     namespace = "com.linkhelm.exp"
     compileSdk = 35
@@ -14,8 +12,8 @@ android {
         applicationId = "com.linkhelm.exp"
         minSdk = 24
         targetSdk = 35
-        versionCode = 67
-        versionName = "beta0.3.1"
+        versionCode = 68
+        versionName = "beta0.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -27,31 +25,18 @@ android {
         }
     }
 
-    signingConfigs {
-        // beta0.3.1: sign with the SAME keystore as the main LinkHelm app
-        // (linkhelm_repo/ci/debug.keystore, alias androiddebugkey). The shipped
-        // LinkHelm-Android-1.1.2 APK is signed with this exact key, so exp now
-        // shares LinkHelm's developer identity. Credentials live in
-        // keystore.properties (gitignored) so the key password never reaches VCS.
-        create("release") {
-            val propsFile = rootProject.file("keystore.properties")
-            if (propsFile.exists()) {
-                val props = Properties()
-                propsFile.inputStream().use { props.load(it) }
-                // keystore.properties lives at the project root, so resolve the
-                // store path against rootProject (not the :app module dir).
-                storeFile = rootProject.file(props.getProperty("STORE_FILE"))
-                storePassword = props.getProperty("STORE_PASSWORD")
-                keyAlias = props.getProperty("KEY_ALIAS")
-                keyPassword = props.getProperty("KEY_PASSWORD")
-            }
-        }
-    }
-
+    // beta0.4.0: the release APK is built UNSIGNED here and signed by the CI
+    // workflow with the SAME keystore as the main LinkHelm app
+    // (ci/debug.keystore, alias androiddebugkey, SHA-256 9E:48:BA:9F:...:C4:B1),
+    // exactly as LinkHelm itself is released. Sharing that certificate means
+    // the installer recognizes exp and the main app as the same developer
+    // identity — no "developer identity unverified" warning for an unknown signer.
+    // For a local signed build, run: apksigner sign --ks ci/debug.keystore
+    // --ks-pass pass:android --key-pass pass:android --out <out>.apk
+    // app/build/outputs/apk/release/app-release-unsigned.apk
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

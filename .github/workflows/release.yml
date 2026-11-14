@@ -1,0 +1,163 @@
+name: Build and Release
+
+# Push a `beta*` / `v*` tag -> both ends are built on GitHub runners and
+# published as a draft release. Binaries never travel from a local machine:
+# only the source push crosses the wire; the heavy artifacts are built and
+# uploaded from GitHub's own network.
+
+on:
+  push:
+    tags:
+      - 'beta*'
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The ubuntu runner ships a preinstalled Android SDK (ANDROID_HOME);
+      # only license acceptance is needed — AGP auto-installs any missing
+      # platform/build-tools components.
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # Release build is intentionally UNSIGNED (see android/app/build.gradle.kts);
+      # signing happens here with the same keystore as every main LinkHelm build.
+      - name: Build release APK
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK (ci/debug.keystore — same identity as the main LinkHelm app)
+        run: |
+          BT="$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+            --ks ci/debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --out "LinkHelm-exp-Android-${GITHUB_REF_NAME}.apk" \
+            android/app/build/outputs/apk/release/app-release-unsigned.apk
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify \
+            "LinkHelm-exp-Android-${GITHUB_REF_NAME}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: LinkHelm-exp-Android-*.apk
+          if-no-files-found: error
+
+  windows:
+    name: Build Windows binaries + self-test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+
+      - name: Build product + test tools
+        shell: msys2 {0}
+        run: |
+          cmake -S . -B build -G "MinGW Makefiles" \
+                -DCMAKE_CXX_COMPILER=g++ \
+                -DCMAKE_MAKE_PROGRAM=mingw32-make
+          cmake --build build --parallel
+
+      # Cross-real-socket loopback assertions; no admin and no WinDivert needed.
+      # The driver layer itself is judged only by tests/driver_probe.exe on the
+      # target PC — never claimed here.
+      - name: Run self-test (17 assertions, no admin required)
+        shell: msys2 {0}
+        run: |
+          ./build/exp_selftest.exe > selftest_output.txt
+          tail -1 selftest_output.txt
+          grep -q "17 passed, 0 failed" selftest_output.txt
+
+      - name: Package win64 zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          $pkg = "LinkHelm-exp-$tag-win64"
+          New-Item -ItemType Directory -Force "$pkg/engine", "$pkg/tests", "$pkg/src" | Out-Null
+
+          Copy-Item build/LinkHelmExp.exe $pkg/
+          Copy-Item windivert/WinDivert.dll, windivert/WinDivert64.sys $pkg/
+          Copy-Item engine/linkhelm_ics.exe $pkg/engine/
+          Copy-Item CMakeLists.txt, README.md, README_zh.md, sponsor_qr.png, THIRD_PARTY_NOTICES.md $pkg/
+          Copy-Item tests/exp_policy.ini.example $pkg/
+          Copy-Item selftest_output.txt $pkg/SELFTEST_RESULT.txt
+          Set-Content -Path "$pkg/linkhelm.log" -Value "log file created here on first run" -Encoding ASCII -NoNewline
+
+          Copy-Item build/driver_probe.exe, build/socks5_probe.exe $pkg/tests/
+          Copy-Item tests/driver_probe.cpp, tests/exp_selftest.cpp, tests/socks5_probe.cpp, `
+                    tests/egress_compare.ps1, tests/verify_baseline.ps1 $pkg/tests/
+          Copy-Item src/*.cpp, src/*.h $pkg/src/
+
+          # BUILD_HASHES.txt: SHA-256 of every file except itself, backslash paths.
+          Push-Location $pkg
+          Get-ChildItem -Recurse -File | Where-Object { $_.Name -ne "BUILD_HASHES.txt" } | ForEach-Object {
+            $rel = $_.FullName.Substring((Get-Location).Path.Length + 1).Replace("/", "\")
+            "{0}  {1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash, $rel
+          } | Sort-Object | Set-Content -Encoding ASCII BUILD_HASHES.txt
+          Pop-Location
+
+          Compress-Archive -Path $pkg -DestinationPath "LinkHelm-exp-$tag-win64.zip" -CompressionLevel Optimal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: LinkHelm-exp-*-win64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release (draft)
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-apk
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+
+      - name: Generate SHA256SUMS.txt
+        run: sha256sum LinkHelm-exp-Android-*.apk LinkHelm-exp-*-win64.zip > SHA256SUMS.txt
+
+      # Draft release — the maintainer reviews and publishes it manually from
+      # the GitHub UI after checking the artifacts.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          FILES=("LinkHelm-exp-Android-${TAG}.apk" "LinkHelm-exp-${TAG}-win64.zip" "SHA256SUMS.txt")
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "LinkHelm-exp ${TAG}" \
+              --notes-file RELEASE_NOTES.md \
+              --draft \
+              --repo "$GITHUB_REPOSITORY"
+          fi

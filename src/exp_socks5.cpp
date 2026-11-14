@@ -147,12 +147,16 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     // That flow occupied one ConnectGate slot for 18.5 SECONDS; with cap 2
     // two such flows starved the whole engine. The gate is gone in 0.2.x,
     // so a slow dial now costs only its own thread.
-    // beta0.2.1: 4000 -> 6000. Field beta0.2.0: SUCCESSFUL connects reached
-    // p95 3123ms under load (p50 70ms) — the phone is simply slower than 4s
-    // sometimes, and every one of the 21 failures died at exactly 4000ms.
-    // 6s covers the observed distribution; a truly dead target still fails
-    // in bounded time (6s, +6s on the single transient retry).
-    DWORD tmo = 6000;
+    // beta0.2.1: 4000 -> 6000. beta0.4.0: 6000 -> 15000. Root cause of
+    // "occasionally kills a good link": the phone side targets its upstream
+    // with connectTimeoutMs = 15000 (ProxyServer.kt), so a slow cellular
+    // dial that WOULD succeed in 6-15 s was being RST by the PC at 6 s
+    // (CONNECT_REPLY_MISSING / WSA 10060). Aligning the control-plane recv
+    // timeout with the phone's dial budget lets the phone's real answer
+    // (SUCCEEDED or REFUSED) arrive instead of a false timeout. A truly
+    // dead target is still bounded: the phone returns REPLY_CONNECTION_
+    // REFUSED at ~15 s, which the PC now receives rather than racing.
+    DWORD tmo = 15000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
                reinterpret_cast<const char*>(&tmo), sizeof(tmo));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,

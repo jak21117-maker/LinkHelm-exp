@@ -49,3 +49,43 @@ target_link_libraries(LinkHelmExp PRIVATE
 
 set_target_properties(LinkHelmExp PROPERTIES
     LINK_FLAGS "-municode -mwindows -static -static-libgcc -static-libstdc++ -s -Wl,--gc-sections")
+
+# ---------------------------------------------------------------------------
+# Test tools (beta0.4.0: also built by CI).
+#
+# exp_selftest: console app, `#include "../src/exp_engine.cpp"` for the
+#   production capture/filter code, links src/exp_socks5.cpp; plain `main`
+#   (no -municode). Runs on any box without admin — safe to execute on CI.
+# socks5_probe: read-only phone probe, pure winsock + src/exp_socks5.cpp.
+# driver_probe: admin-only WinDivert layer verdict; built but never run on CI.
+# ---------------------------------------------------------------------------
+add_executable(exp_selftest
+    tests/exp_selftest.cpp
+    src/exp_socks5.cpp)
+target_include_directories(exp_selftest PRIVATE src windivert)
+target_compile_definitions(exp_selftest PRIVATE
+    UNICODE _UNICODE _WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(exp_selftest PRIVATE -fno-rtti -fno-exceptions)
+target_link_libraries(exp_selftest PRIVATE ws2_32 wsock32 iphlpapi)
+set_target_properties(exp_selftest PROPERTIES
+    LINK_FLAGS "-static -static-libgcc -static-libstdc++ -s")
+
+add_executable(socks5_probe
+    tests/socks5_probe.cpp
+    src/exp_socks5.cpp)
+target_include_directories(socks5_probe PRIVATE src windivert)
+target_compile_definitions(socks5_probe PRIVATE
+    UNICODE _UNICODE _WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(socks5_probe PRIVATE -fno-rtti -fno-exceptions)
+target_link_libraries(socks5_probe PRIVATE ws2_32 wsock32)
+set_target_properties(socks5_probe PROPERTIES
+    LINK_FLAGS "-static -static-libgcc -static-libstdc++ -s")
+
+add_executable(driver_probe tests/driver_probe.cpp)
+target_include_directories(driver_probe PRIVATE windivert)
+target_compile_definitions(driver_probe PRIVATE
+    UNICODE _UNICODE _WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(driver_probe PRIVATE -fno-rtti -fno-exceptions)
+target_link_libraries(driver_probe PRIVATE ws2_32 wsock32)
+set_target_properties(driver_probe PROPERTIES
+    LINK_FLAGS "-static -static-libgcc -static-libstdc++ -s")
