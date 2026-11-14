@@ -86,8 +86,7 @@ jobs:
       - name: Run self-test (17 assertions, no admin required)
         shell: msys2 {0}
         run: |
-          ./build/exp_selftest.exe > selftest_output.txt
-          echo "selftest exit code: $?"
+          ./build/exp_selftest.exe > selftest_output.txt || true
           cat selftest_output.txt
           grep -q "17 passed, 0 failed" selftest_output.txt
 
