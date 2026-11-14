@@ -101,7 +101,7 @@ jobs:
           Copy-Item build/LinkHelmExp.exe $pkg/
           Copy-Item windivert/WinDivert.dll, windivert/WinDivert64.sys $pkg/
           Copy-Item engine/linkhelm_ics.exe $pkg/engine/
-          Copy-Item CMakeLists.txt, README.md, README_zh.md, sponsor_qr.png, THIRD_PARTY_NOTICES.md $pkg/
+          Copy-Item CMakeLists.txt, README.md, README_zh.md, sponsor_qr.png, THIRD_PARTY_NOTICES.md, LICENSE, SECURITY.md $pkg/
           Copy-Item tests/exp_policy.ini.example $pkg/
           Copy-Item selftest_output.txt $pkg/SELFTEST_RESULT.txt
           Set-Content -Path "$pkg/linkhelm.log" -Value "log file created here on first run" -Encoding ASCII -NoNewline

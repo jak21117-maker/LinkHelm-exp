@@ -640,6 +640,7 @@ int main(int argc, char** argv) {
     //    packets and the phone endpoint. No driver needed for these helpers.
     {
         HMODULE dll = LoadLibraryA("dist/WinDivert.dll");
+        if (!dll) dll = LoadLibraryA("windivert/WinDivert.dll");
         if (!dll) {
             Check(false, "WinDivert.dll helper API available",
                   "LoadLibrary failed (run from the exp project root)");

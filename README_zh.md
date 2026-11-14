@@ -155,13 +155,12 @@ LinkHelm-exp 是 LinkHelm 的实验分支，开发与维护都来自作者的个
 
 ## 致谢
 
-LinkHelm（母项目）基于 nestchao 的开源项目 **Hotspot-Bypass-VPN-Unlimited-Hotspot** 衍生。
+LinkHelm-exp 是 [LinkHelm](https://github.com/jak21117-maker/LinkHelm) 的实验分支。数据面基于以下开源项目研究、改造并落地：
 
-- 原项目：<https://github.com/nestchao/Hotspot-Bypass-VPN-Unlimited-Hotspot>
+- **WinDivert**（basil00，LGPL-2.1/GPL-2.0 双许可）—— 本分支赖以运行的内核级捕获/回注基础：https://reqrypt.org/windivert.html · https://github.com/basil00/WinDivert
+- **okatodev/wfp-divert**（MIT）—— TCP 反射方案来源；源码快照随仓库分发于 `wfp-divert-ref/`：https://github.com/okatodev/wfp-divert
+- **InterceptSuite/ProxyBridge**（MIT）—— relay 架构参考：TCP NAT/conntrack 生命周期、按真实端点的 underlay 排除、自适应并发：https://github.com/InterceptSuite/ProxyBridge
 
-LinkHelm 保留了原始思路 —— 通过 Wi-Fi Direct 以 SOCKS5 代理把手机连接共享到本地 —— 但做了大量重写与扩展。LinkHelm-exp 进一步把 Wintun+lwIP 数据面替换为 WinDivert+SOCKS5 反射数据面，手机端 SOCKS5 Host 端点 100% 不变。
-
-- LinkHelm 项目（母项目）：<https://github.com/jak21117-maker/LinkHelm>
-- LinkHelm-exp（本分支）：见仓库根目录。
+手机端 SOCKS5 Host 是主线 LinkHelm 宿主应用 —— 100% 未改动。
 
 第三方组件保留其各自许可证 —— 见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。按"原样"提供，不附带任何担保。

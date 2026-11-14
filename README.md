@@ -153,13 +153,12 @@ LinkHelm-exp is an experimental branch of LinkHelm. Development and maintenance 
 
 ## Acknowledgements and credits
 
-LinkHelm (the parent project) is a derivative work based on the open-source project **Hotspot-Bypass-VPN-Unlimited-Hotspot** by nestchao.
+LinkHelm-exp is an experimental branch of [LinkHelm](https://github.com/jak21117-maker/LinkHelm). The data plane is rebuilt on top of these open-source projects — studied, adapted, and shipped:
 
-- Original project: <https://github.com/nestchao/Hotspot-Bypass-VPN-Unlimited-Hotspot>
+- **WinDivert** by basil00 (LGPL-2.1/GPL-2.0 dual license) — the kernel-level capture/reinject foundation this branch runs on: <https://reqrypt.org/windivert.html> · <https://github.com/basil00/WinDivert>
+- **okatodev/wfp-divert** (MIT) — the TCP reflection scheme; the source snapshot is shipped in `wfp-divert-ref/`: <https://github.com/okatodev/wfp-divert>
+- **InterceptSuite/ProxyBridge** (MIT) — relay architecture reference: TCP NAT/conntrack lifecycle, per-endpoint underlay exclusion, adaptive concurrency: <https://github.com/InterceptSuite/ProxyBridge>
 
-LinkHelm keeps the original idea — sharing a phone's connection locally over Wi-Fi Direct through a SOCKS5 proxy — but has been substantially rewritten and extended. LinkHelm-exp further replaces the Wintun+lwIP data plane with a WinDivert+SOCKS5 reflection data plane, keeping the phone-host SOCKS5 endpoint 100% unchanged.
-
-- LinkHelm project (parent): <https://github.com/jak21117-maker/LinkHelm>
-- LinkHelm-exp (this branch): see the repository root.
+The phone-side SOCKS5 Host is 100% the mainline LinkHelm host app — unchanged.
 
 Third-party components keep their own licenses — see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Provided "as is", without warranty.
