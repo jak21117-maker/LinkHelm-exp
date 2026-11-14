@@ -144,6 +144,41 @@ UDP/53 会被捕获」（DNS 兜底路径可达 —— 直接对应 Wi-Fi 的 In
 
 ## Changelog
 
+### beta0.3.1 — revert broken black-hole suppression; sign exp with the LinkHelm keystore
+
+**Root cause of the beta0.3.0 regression (worse connectivity than beta0.2.3).**
+The Android black-hole suppressor never fired: on each sub-3 failure it stored
+`untilMs=0`, so the next failure saw `now >= 0` true and reset the counter to 1 —
+the 3-consecutive-failure threshold was unreachable. The phone therefore kept
+doing full 15 s dials on every black-holed target (Google IPv4, 8.8.8.8:53),
+exhausting its TCP thread pool. Symptom in the field: 50 `SELECT_TIMEOUT` to
+`192.168.49.1:8080` (PC could not even reach the phone SOCKS5), DNS fail rate
+jumped from 1/362 (beta0.2.3) to 114/289 (beta0.3.0), TCP fail 295/506.
+
+**Android**
+- Removed the entire black-hole suppressor (fields, entry check, success-clear,
+  failure counter). The phone now behaves exactly as beta0.2.3: 15 s
+  `connectTimeoutMs`, `singleHandshake`/`deepProbe`, 8080/8082 lanes unchanged.
+- Signed with the **same keystore as the main LinkHelm app**
+  (`linkhelm_repo/ci/debug.keystore`, alias `androiddebugkey`, SHA-256
+  `9E:48:BA:9F:…:C4:B1`). The shipped `LinkHelm-Android-1.1.2-debug.apk` carries
+  this exact cert, so exp now shares LinkHelm's developer identity — the
+  "developer identity unverified" warning that appeared under the previous
+  dedicated `linkhelm-exp-release.keystore` no longer applies (same cert as the
+  app that already installs cleanly). versionCode 67, versionName beta0.3.1.
+
+**PC — logging**
+- `WarnLog` global throttle tightened from 5 s to 30 s (one anomalous line per
+  30 s at most). The periodic stats row still carries every counter, so the
+  coarser throttle only trims repeated per-flow noise. With the phone no longer
+  thread-starved, SOCKS5 CONNECT / DNS upstream error lines drop to near-zero.
+- Version strings bumped beta0.3.0 -> beta0.3.1.
+
+**Verification:** PC `cmake` build clean, self-test 17/17; Android
+`assembleRelease` BUILD SUCCESSFUL; `apksigner` confirms Signer#1 SHA-256 of the
+exp APK equals the 1.1.2 APK exactly. End-to-end not reproduced here (phone
+offline, WinDivert needs admin).
+
 ### beta0.3.0 — English-only low-volume logs + independent `linkhelm-exp` host
 
 Field log of beta0.2.3: 6148 lines, ~5000 of them per-flow lifecycle rows for

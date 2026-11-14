@@ -1,0 +1,4 @@
+
+# release signing key + credentials (must never be committed)
+keystore/
+keystore.properties

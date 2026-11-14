@@ -645,14 +645,15 @@ struct ExpPolicy {
 static std::atomic<bool> g_flow_log{false};
 static std::atomic<int>  g_stats_interval_s{10};
 
-// beta0.3.0: one anomalous line per 5 s at most. Counters in the periodic
-// stats row are always complete, so throttling never hides a failure trend.
+// beta0.3.1: one anomalous line per 30 s at most. The periodic stats row
+// already carries the complete counters, so a coarse global throttle only
+// trims the repeated per-flow noise without hiding any failure trend.
 static std::atomic<uint64_t> g_warn_last_ms{0};
 static void WarnLog(const std::function<void(const std::wstring&)>& log,
                     const std::wstring& msg) {
     uint64_t now = GetTickCount64();
     uint64_t prev = g_warn_last_ms.load();
-    if (now - prev < 5000) return;
+    if (now - prev < 30000) return;
     if (!g_warn_last_ms.compare_exchange_strong(prev, now)) return;
     log(msg);
 }

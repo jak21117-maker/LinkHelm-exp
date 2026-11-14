@@ -259,15 +259,6 @@ class ProxyServer internal constructor(
     private val totalConnections = AtomicInteger(0)
     private val rejectedConnections = AtomicInteger(0)
 
-    // beta0.3.0 (exp): target-level black-hole suppression. This is NOT a
-    // port switch and NOT a tunnel rebuild -- UpstreamNetworkManager's
-    // singleHandshake/deepProbe, the 8080/8082 lane logic and the 15 s
-    // connectTimeoutMs are all UNCHANGED. A destination is suppressed only
-    // after 3 CONSECUTIVE dial failures, for 60 s, and only NEW CONNECT
-    // requests are affected. Established sessions are never touched, and one
-    // later success clears the accumulated failures immediately.
-    private data class BlackholeState(val failures: Int, val untilMs: Long)
-    private val blackhole = ConcurrentHashMap<String, BlackholeState>()
     private val activeByClient = ConcurrentHashMap<String, AtomicInteger>()
 
     // v1.5.45 (beta1.0.1): UDP associations get their OWN admission budget
@@ -1180,15 +1171,6 @@ class ProxyServer internal constructor(
         request: Socks5Parser.Request,
         clientId: String
     ) {
-        val targetHost = request.targetHost
-        val suppressed = blackhole[targetHost]
-        if (suppressed != null && suppressed.untilMs > System.currentTimeMillis()) {
-            rejectedConnections.incrementAndGet()
-            sendReply(output, Socks5Parser.REPLY_CONNECTION_REFUSED)
-            log(ProxyLogLevel.WARN,
-                "[$clientId] black-hole suppressed $targetHost (confirmed unreachable)")
-            return
-        }
         val target = Socket().apply {
             tcpNoDelay = true
             keepAlive = true
@@ -1201,7 +1183,6 @@ class ProxyServer internal constructor(
         try {
             if (!running.get()) throw SocketException("Proxy server is stopping")
             target.connect(InetSocketAddress(request.targetHost, request.targetPort), config.connectTimeoutMs)
-            blackhole.remove(targetHost)   // one success invalidates the consecutive-failure chain
             session = TcpSession(clientId, client, target)
             activeTcpSessions.add(session)
 
@@ -1211,20 +1192,6 @@ class ProxyServer internal constructor(
         } catch (error: Exception) {
             if (session == null) {
                 sendReply(output, Socks5Parser.REPLY_CONNECTION_REFUSED)
-                if (running.get()) {
-                    val now = System.currentTimeMillis()
-                    val prev = blackhole[targetHost]
-                    val failures = (if (prev == null || now >= prev.untilMs) 0
-                                    else prev.failures) + 1
-                    if (failures >= 3) {
-                        blackhole[targetHost] = BlackholeState(failures, now + 60_000L)
-                        log(ProxyLogLevel.WARN,
-                            "[$clientId] black-hole confirmed for $targetHost after " +
-                                    "$failures consecutive dial failures (60 s suppress)")
-                    } else {
-                        blackhole[targetHost] = BlackholeState(failures, 0L)
-                    }
-                }
             }
             if (running.get()) {
                 log(

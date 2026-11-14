@@ -14,8 +14,8 @@ android {
         applicationId = "com.linkhelm.exp"
         minSdk = 24
         targetSdk = 35
-        versionCode = 66
-        versionName = "beta0.3.0"
+        versionCode = 67
+        versionName = "beta0.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -28,11 +28,11 @@ android {
     }
 
     signingConfigs {
-        // beta0.3.0: dedicated release keystore with a verifiable developer
-        // identity (CN=LinkHelm-exp, O=LinkHelm). Replaces the generic Android
-        // debug cert that triggered "developer identity unverified" on install.
-        // Credentials live in keystore.properties (gitignored) so the key
-        // password never lands in source control.
+        // beta0.3.1: sign with the SAME keystore as the main LinkHelm app
+        // (linkhelm_repo/ci/debug.keystore, alias androiddebugkey). The shipped
+        // LinkHelm-Android-1.1.2 APK is signed with this exact key, so exp now
+        // shares LinkHelm's developer identity. Credentials live in
+        // keystore.properties (gitignored) so the key password never reaches VCS.
         create("release") {
             val propsFile = rootProject.file("keystore.properties")
             if (propsFile.exists()) {
