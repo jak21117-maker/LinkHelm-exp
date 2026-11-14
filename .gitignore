@@ -7,3 +7,11 @@ tests/*.exe
 
 # local backup of the 1.1.3 baseline (not part of the exp repo)
 backup_v1.1.3/
+
+# independent exp Android host: keep sources, drop generated output and
+# machine-local SDK path (the AAR in app/libs IS a required dependency)
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
+android/.idea/

@@ -25,3 +25,14 @@ FirewallInboundAllow=0
 ; starts at 8, halves on phone saturation, +1 after 16 successes).
 ; Fixed 1..64 for controlled experiments.
 ConnectConcurrency=0
+
+; beta0.3.0 log volume. All runtime logs are English regardless of UI language.
+; FlowLog=0 (default): per-flow lifecycle lines are OFF; anomalous lines are
+;   emitted at most 1 per 5 s; one compact aggregate row per interval.
+; FlowLog=1: restores full per-flow capture/connect/close rows and the
+;   complete (60+ field) aggregate row for field diagnosis.
+FlowLog=0
+
+; Aggregate stats row cadence in seconds (5..300, default 10).
+; Higher values reduce log volume further without losing counters.
+StatsIntervalSec=10

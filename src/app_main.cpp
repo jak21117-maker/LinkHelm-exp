@@ -6,7 +6,7 @@
 // result to the window; the tray is a plain Shell_NotifyIcon that cannot be
 // "missing from the build".
 //
-// LinkHelm-exp beta0.2.3 — experimental transparent data plane.
+// LinkHelm-exp beta0.3.0 — experimental transparent data plane.
 // The store-boost page is REMOVED; pages: Connect (WinDivert+SOCKS5 engine,
 // ICS sharing) and Share/Transfer (file transfer assistant). No Wintun, no
 // lwIP, no virtual adapter: the phone's SOCKS5 host is reached directly over
@@ -1272,7 +1272,7 @@ static void ConnectWithRetry(linkhelm::ExpConfig cfg) {
     if (g_app.reconnect_busy.exchange(true)) return;
     g_app.abort_reconnect.store(false);
     if (cfg.phone_ip.empty() || cfg.phone_port <= 0) {
-        Log(TR(L"Enter the phone IP and port", L"请填写手机 IP 和端口"));
+        Log(L"[connect] enter the phone IP and port");
         UiEnable(g_app.conn_btn, TRUE);
         UiEnable(g_app.disc_btn, FALSE);
         UiText(g_app.conn_status,
@@ -1282,8 +1282,7 @@ static void ConnectWithRetry(linkhelm::ExpConfig cfg) {
     }
     for (int streak = 1;; ++streak) {
         if (g_app.abort_reconnect.load() || g_app.quitting.load()) {
-            Log(TR(L"[reconnect] stopped (user disconnect / shutdown)",
-                   L"[重连] 已停止（用户断开 / 程序退出）"));
+            Log(L"[reconnect] stopped (user disconnect / shutdown)");
             break;
         }
         std::wstring err;
@@ -1292,8 +1291,7 @@ static void ConnectWithRetry(linkhelm::ExpConfig cfg) {
             // user hit Disconnect while the attempt was in flight: do not
             // publish "connected", just tear it straight back down.
             StopEngineSafe();
-            Log(TR(L"[reconnect] stopped (user disconnect / shutdown)",
-                   L"[重连] 已停止（用户断开 / 程序退出）"));
+            Log(L"[reconnect] stopped (user disconnect / shutdown)");
             break;
         }
         if (ok) {
@@ -1309,8 +1307,7 @@ static void ConnectWithRetry(linkhelm::ExpConfig cfg) {
         Log(L"[exp] connect failed: " + err);
         StopEngineSafe();
         if (streak >= 10) {
-            Log(TR(L"[reconnect] 10 consecutive failures - auto disconnect, no more retries",
-                   L"[重连] 连续失败 10 次，自动断开并停止重试"));
+            Log(L"[reconnect] 10 consecutive failures - auto disconnect, no more retries");
             UiEnable(g_app.conn_btn, TRUE);
             UiEnable(g_app.disc_btn, FALSE);
             UiText(g_app.conn_status,
@@ -1318,10 +1315,8 @@ static void ConnectWithRetry(linkhelm::ExpConfig cfg) {
                       L"状态：未连接（连续失败 10 次，已自动断开）"));
             break;
         }
-        Log((g_lang_zh
-                 ? L"[重连] 第 " + std::to_wstring(streak) + L"/10 次失败，2 秒后重试…"
-                 : L"[reconnect] attempt " + std::to_wstring(streak) +
-                       L"/10 failed, retrying in 2s..."));
+        Log(L"[reconnect] attempt " + std::to_wstring(streak) +
+            L"/10 failed, retrying in 2s...");
         // beta1.1.3: 3s -> 2s; interruptible 25ms slices so Disconnect/Quit
         // is instant. 10 failures still take ~20s, gentle on the hotspot.
         for (int i = 0; i < 80 && !g_app.abort_reconnect.load() &&
@@ -1343,7 +1338,7 @@ static void RequestQuit() {
     g_app.abort_reconnect.store(true);
     if (g_app.tray) g_app.tray->Remove();
     if (g_app.hwnd && IsWindow(g_app.hwnd)) ShowWindow(g_app.hwnd, SW_HIDE);
-    Log(TR(L"[quit] cleaning up network...", L"[退出] 正在清理网络…"));
+    Log(L"[quit] cleaning up network...");
     std::thread([] {
         StopEngineSafe();
         if (g_app.hwnd && IsWindow(g_app.hwnd))
@@ -2027,7 +2022,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MessageBoxW(hwnd,
                         g_lang_zh
                             ? L"【产品说明】\n"
-                              L"LinkHelm-exp beta0.2.3（实验版）。无虚拟网卡透明上网："
+                              L"LinkHelm-exp beta0.3.0（实验版）。无虚拟网卡透明上网："
                               L"WinDivert 拦截本机流量，经 Wi-Fi Direct 直连手机上的 "
                               L"SOCKS5 出口（TCP CONNECT + UDP ASSOCIATE，RFC 1929 "
                               L"用户名/密码认证）。不含商店加速；连接、共享(ICS)、"
@@ -2048,7 +2043,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               L"仅供个人学习与合法用途。使用者应遵守所在地法律法规，"
                               L"不得用于任何违法用途。软件按『现状』提供，不附带任何担保。"
                             : L"[Product]\n"
-                              L"LinkHelm-exp beta0.2.3 (experimental). Transparent "
+                              L"LinkHelm-exp beta0.3.0 (experimental). Transparent "
                               L"networking WITHOUT a virtual adapter: WinDivert "
                               L"captures host traffic and forwards it to the "
                               L"SOCKS5 host on your phone over Wi-Fi Direct "
@@ -2345,7 +2340,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
         if (single) CloseHandle(single);
         return 0;
     }
-    // LinkHelm-exp beta0.2.3: no TUN adapter / lwIP engine / pinned default
+    // LinkHelm-exp beta0.3.0: no TUN adapter / lwIP engine / pinned default
     // route / child engine process to clean up at startup. The WinDivert
     // filters die with the process (kernel closes the handle), and the
     // engine removes its half-routes on Stop. A hard-killed session can
@@ -2392,8 +2387,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     RegisterClassW(&swc);
 
     HWND hwnd = CreateWindowExW(0, kClass,
-        TR(L"LinkHelm-exp beta0.2.3 (WinDivert, no virtual adapter)",
-           L"LinkHelm-exp beta0.2.3（WinDivert 无虚拟网卡实验版）"),
+        TR(L"LinkHelm-exp beta0.3.0 (WinDivert, no virtual adapter)",
+           L"LinkHelm-exp beta0.3.0（WinDivert 无虚拟网卡实验版）"),
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                     WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, kWidth, kHeight,

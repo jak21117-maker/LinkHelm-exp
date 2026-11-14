@@ -144,6 +144,63 @@ UDP/53 会被捕获」（DNS 兜底路径可达 —— 直接对应 Wi-Fi 的 In
 
 ## Changelog
 
+### beta0.3.0 — English-only low-volume logs + independent `linkhelm-exp` host
+
+Field log of beta0.2.3: 6148 lines, ~5000 of them per-flow lifecycle rows for
+healthy flows. Flow census: 1275 successful TCP flows, 942 `app closed first`,
+204 `phone closed first`, 21 CONNECT failures (all Google IPv4 black holes);
+DNS 361 ok / 1 fail with `loopback reset 24` and `recv-fatal 0` — the DNS
+receive loop fix holds. 199 flows sent >=300 B and received <100 B (162 on
+:8081 with a 26 B + FIN answer, 45 on :443 with 99 B then RST), i.e. target /
+phone-uplink silence faithfully relayed by the PC — no packet loss in the
+WinDivert reflection path.
+
+**PC — logging**
+- All runtime log literals in `exp_engine.cpp` and every `Log()` call in
+  `app_main.cpp` are now English regardless of UI language. UI labels keep
+  their existing bilingual `TR()` behaviour.
+- `FlowLog=0` (default) disables per-flow capture / connect / close / close-
+  reason rows. `FlowLog=1` restores them and the full 60+ field stats row.
+- Anomalous per-flow rows (CONNECT failure, UDP ASSOCIATE failure, inject
+  failure, orphan drop, NAT collision, DNS upstream redirect, session cap,
+  no-NAT refusal) go through `WarnLog()` — at most one line per 5 s across all
+  detached workers. Counters are never throttled, so trends stay visible.
+- Default aggregate row is now one compact line (TCP ok/fail, DNS ok/fail,
+  app/phone/zero-byte closes, CONNECT p50/p95, UDP, leak, orphan-drop).
+  Cadence is configurable via `StatsIntervalSec` (5..300 s, default 10).
+- Fixed a switch that was parsed but never published: `g_flow_log` is now
+  copied out of `Impl` in `Start()` exactly once, as detached workers must
+  never touch `Impl` after `Stop()`.
+- `silent-target` counter separates a normal HTTP short-lived close from a
+  request that went unanswered (`up >= 300 B && down < 100 B`), so the 942
+  `app-closed` rows no longer look like one uniform failure.
+
+**Phone — independent exp host (new `android/` tree, mainline untouched)**
+- `applicationId` / namespace `com.linkhelm.exp`, `versionCode 66`,
+  `versionName beta0.3.0`, app label / notification / VPN session renamed to
+  `linkhelm-exp`. Installable side by side with the mainline `com.linkhelm.app`.
+- Target-level black-hole suppression: after **3 consecutive dial failures**
+  to one destination, new CONNECT requests to it are answered immediately with
+  `REPLY_CONNECTION_REFUSED` for 60 s, so the PC sends RST at once instead of
+  waiting through the 6 s control timeout twice. One later success clears the
+  chain. Established sessions are never touched.
+- **Deliberately unchanged** (stability contract): `connectTimeoutMs = 15 s`,
+  `UpstreamNetworkManager.singleHandshake` / `deepProbe`, the 8080/8082 lane
+  logic, and every port-switch / tunnel-rebuild decision. No fast-failover on
+  a single failure was introduced.
+
+**Verification (local, honest scope)**
+- PC: `cmake --build` clean; self-test 17/17 (beta0.3.0); exe smoke test alive
+  after 5 s; binary contains 4x `beta0.3.0` and 0x `beta0.2.3`.
+- Phone: `assembleDebug` BUILD SUCCESSFUL; `aapt dump badging` confirms
+  `com.linkhelm.exp` / 66 / `beta0.3.0` / label `linkhelm-exp`.
+- **Not verified end to end**: the phone (192.168.49.1:8080) was not reachable
+  from this machine, and WinDivert NETWORK-layer capture still requires an
+  elevated `tests/driver_probe.exe` run. Real-device judgement: default log
+  volume should be tens of lines instead of thousands; `app-closed` should
+  shrink relative to `silent-target`; Google-IP CONNECT failures should stop
+  consuming 12 s each.
+
 ### beta0.2.3 — 本地 DNS 接收线程存活加固 + 上游失败可观测（按诊断建议的最小修改范围）
 
 数据源 = beta0.2.2 真机对照测试：透明 HTTPS curl(28) 5004ms、显式 SOCKS5

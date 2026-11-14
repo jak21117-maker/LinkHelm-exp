@@ -92,7 +92,7 @@ bool LoadWinDivert(WD* wd, std::wstring* err) {
     wd->dll = LoadLibraryW(path.c_str());
     if (!wd->dll) {
         if (err)
-            *err = L"WinDivert.dll 加载失败（需与 exe 同目录）: " + path;
+            *err = L"WinDivert.dll load failed (must be next to exe): " + path;
         return false;
     }
     wd->open = reinterpret_cast<WD_Open>(
@@ -108,7 +108,7 @@ bool LoadWinDivert(WD* wd, std::wstring* err) {
     wd->checksums = reinterpret_cast<WD_Checksums>(
         GetProcAddress(wd->dll, "WinDivertHelperCalcChecksums"));
     if (!wd->ok()) {
-        if (err) *err = L"WinDivert.dll 缺少必要的导出函数";
+        if (err) *err = L"WinDivert.dll missing required exports";
         FreeLibrary(wd->dll);
         wd->dll = nullptr;
         return false;
@@ -279,11 +279,11 @@ enum CloseReason : int {
 
 const wchar_t* CloseReasonName(int r) {
     switch (r) {
-        case kCloseEof: return L"recv EOF（对端 FIN）";
-        case kCloseReset: return L"recv WSAECONNRESET 10054（连接被重置）";
-        case kCloseSendFail: return L"send 失败（中继写入异常）";
-        case kCloseSockErr: return L"recv SOCKET_ERROR（其它错误码）";
-        default: return L"未正常结束";
+        case kCloseEof: return L"recv EOF (peer FIN)";
+        case kCloseReset: return L"recv WSAECONNRESET 10054 (connection reset)";
+        case kCloseSendFail: return L"send failed (relay write error)";
+        case kCloseSockErr: return L"recv SOCKET_ERROR (other code)";
+        default: return L"abnormal end";
     }
 }
 
@@ -494,6 +494,10 @@ struct EngineStats {
     std::atomic<uint64_t> tcp_zero_close{0};  // connected, 0 bytes, closed
     std::atomic<uint64_t> tcp_eof_remote{0};  // phone side closed first
     std::atomic<uint64_t> tcp_eof_app{0};     // app side closed first
+    // beta0.3.0: separates a normal HTTP short-lived close from a request
+    // that went unanswered. Field beta0.2.3: 942 "app-closed", but only 199
+    // had up>=300B / down<100B (target silent); the rest completed normally.
+    std::atomic<uint64_t> tcp_silent_target{0};
     // Plan §6: the {dst_ip, src_port} NAT key can collide when two local
     // addresses (or two destination ports) reuse the same source port.
     // Count and REFUSE rather than silently splicing two flows together.
@@ -627,7 +631,31 @@ struct ExpPolicy {
     bool aaaa_suppress = true;      // true  = NOERROR/empty for AAAA
     bool firewall_allow = false;    // true  = install inbound allow rule
     int  concurrency = 0;           // 0 = adaptive (ProxyBridge/Tqk style)
+    // beta0.3.0: per-flow chatter is OFF by default. The beta0.2.3 field
+    // log was 6148 lines, ~5000 of them "captured / connected / closed"
+    // rows for healthy flows. Diagnostics are an OPT-IN switch, not the
+    // default; abnormal flows are still always logged.
+    bool flow_log = false;          // true = verbose per-flow lifecycle
+    int  stats_interval_s = 10;     // aggregate line cadence (seconds)
 };
+
+// Single global read-only switch, published once from Start(). Every log
+// site consults it: no policy object has to be threaded through detached
+// workers (they must never touch Impl after Stop).
+static std::atomic<bool> g_flow_log{false};
+static std::atomic<int>  g_stats_interval_s{10};
+
+// beta0.3.0: one anomalous line per 5 s at most. Counters in the periodic
+// stats row are always complete, so throttling never hides a failure trend.
+static std::atomic<uint64_t> g_warn_last_ms{0};
+static void WarnLog(const std::function<void(const std::wstring&)>& log,
+                    const std::wstring& msg) {
+    uint64_t now = GetTickCount64();
+    uint64_t prev = g_warn_last_ms.load();
+    if (now - prev < 5000) return;
+    if (!g_warn_last_ms.compare_exchange_strong(prev, now)) return;
+    log(msg);
+}
 
 // Win32 profile API: wide paths, no exceptions (build uses -fno-exceptions),
 // no std::filesystem / ifstream(wstring) portability traps. The file lives
@@ -654,6 +682,11 @@ ExpPolicy LoadPolicy() {
     p.aaaa_suppress = (_wcsicmp(buf, L"allow") != 0);
     read(L"FirewallInboundAllow", L"0");
     p.firewall_allow = (_wcsicmp(buf, L"1") == 0);
+    read(L"FlowLog", L"0");
+    p.flow_log = (_wcsicmp(buf, L"1") == 0);
+    int si = GetPrivateProfileIntW(sec, L"StatsIntervalSec", 10,
+                                   path.c_str());
+    if (si >= 5 && si <= 300) p.stats_interval_s = si;
     int c = GetPrivateProfileIntW(sec, L"ConnectConcurrency", 0,
                                   path.c_str());
     if (c >= 1 && c <= 64) p.concurrency = c;
@@ -710,13 +743,13 @@ bool WdInject(HANDLE divert, const WD& wd, void* pkt, UINT len,
     // Low-frequency by design: first 5 failures are always logged (enough to
     // diagnose), then every 200th so a broken handle cannot flood the UI.
     if (log && (n <= 5 || n % 200 == 0)) {
-        log(std::wstring(L"[exp] 回注失败 #") + std::to_wstring(flow_id) + L" " +
+        WarnLog(log, std::wstring(L"[exp] inject failed #") + std::to_wstring(flow_id) + L" " +
             what + L" err=" + std::to_wstring((unsigned long long)err) +
-            L" 方向=" + (addr && addr->Outbound ? L"出站" : L"入站") +
+            L" dir=" + (addr && addr->Outbound ? L"outbound" : L"inbound") +
             L" IfIdx=" + std::to_wstring(addr ? addr->Network.IfIdx : 0) +
             L"/" + std::to_wstring(addr ? addr->Network.SubIfIdx : 0) +
             L" len=" + std::to_wstring(len) + L" sent=" +
-            std::to_wstring(sent) + L"（累计失败 " + std::to_wstring(n) + L"）");
+            std::to_wstring(sent) + L" (cumulative failures " + std::to_wstring(n) + L")");
     }
     return false;
 }
@@ -967,7 +1000,7 @@ void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
                 // beta0.2.3: name the failure instead of a bare DNS 失败 —
                 // distinguishes phone-unreachable from resolver-timeout.
                 stats->dns_up_connect_fail.fetch_add(1);
-                log_upstream(L"[exp] DNS 上游 CONNECT 失败（两条上游均不可达）: " +
+                log_upstream(L"[exp] DNS upstream CONNECT failed (both resolvers unreachable): " +
                              FromUtf8(err));
                 break;
             }
@@ -1010,11 +1043,11 @@ void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
                 if (fail_stage == 1) stats->dns_up_send_fail.fetch_add(1);
                 else stats->dns_up_recv_fail.fetch_add(1);
                 if (from_pool) stats->dns_pool_reuse_fail.fetch_add(1);
-                log_upstream(std::wstring(L"[exp] DNS 上游") +
-                             (fail_stage == 1 ? L"发送" : L"接收") +
-                             L"失败 err=" + std::to_wstring(fail_err) +
-                             L"（" + (from_pool ? L"池化链路" : L"新拨链路") +
-                             L"）— 关闭重试");
+                log_upstream(std::wstring(L"[exp] DNS upstream") +
+                             (fail_stage == 1 ? L"send" : L"recv") +
+                             L"failed err=" + std::to_wstring(fail_err) +
+                             L"(" + (from_pool ? L"pooled link" : L"fresh dial") +
+                             L") - closing and retrying");
                 closesocket(s);
                 continue;  // retry once with a fresh link
             }
@@ -1080,15 +1113,15 @@ void DnsProxyLoop(DnsProxy* p, const std::string& phone8, uint16_t phone_port,
                 int64_t now = DnsCacheNowMs();
                 if (now - last_reset_log_ms >= 3000) {
                     last_reset_log_ms = now;
-                    log(L"[exp] DNS 接收线程收到 UDP err=" +
+                    log(L"[exp] DNS receive loop got UDP err=" +
                         std::to_wstring(e) +
-                        L"（此前回包送往已关闭端口，忽略并继续）");
+                        L"(earlier reply went to a closed port, ignored)");
                 }
                 continue;
             }
             stats->dns_loop_fatal.fetch_add(1);
-            log(L"[exp] DNS_DEGRADED: 接收线程致命错误 err=" +
-                std::to_wstring(e) + L" — 本地 DNS 接收停止，解析将超时");
+            log(L"[exp] DNS_DEGRADED: receive loop fatal err=" +
+                std::to_wstring(e) + L" - local DNS receive stopped, lookups will time out");
             break;
         }
         if (n <= 0) continue;  // zero-length datagram: nothing to answer
@@ -1212,7 +1245,7 @@ void DnsWorker(HANDLE divert, WD wd, std::string phone8, uint16_t phone_port,
         addr.Network.IfIdx = if_idx;
         addr.Network.SubIfIdx = sub_if_idx;
         wd.checksums(pkt.data(), (UINT)psz, &addr, 0);
-        ok = WdInject(divert, wd, pkt.data(), (UINT)psz, &addr, L"DNS 回包",
+        ok = WdInject(divert, wd, pkt.data(), (UINT)psz, &addr, L"DNS reply",
                       0, stats, log);
     } while (false);
     if (ok) stats->dns_ok.fetch_add(1);
@@ -1256,8 +1289,8 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     // NOTE: this pointer is &Impl::running (true == engine RUNNING), despite
     // the historical parameter name "stop".
     if (!stop->load()) {
-        log(L"[exp] #" + std::to_wstring(flow_id) +
-            L" 引擎停止 → 取消（未向手机发起 CONNECT）→ " + dstw);
+        WarnLog(log, L"[exp] #" + std::to_wstring(flow_id) +
+            L" engine stopped -> cancelled (no CONNECT sent) -> " + dstw);
         s->want_reset.store(true);
         SessionFinalize(s, reg, stats, budget);
         return;
@@ -1296,8 +1329,9 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
         if (r != INVALID_SOCKET) {
             if (attempt > 0) {
                 stats->connect_retry_ok.fetch_add(1);
+                if (g_flow_log.load())
                 log(L"[exp] #" + std::to_wstring(flow_id) +
-                    L" CONNECT 重试成功 → " + dstw);
+                    L" CONNECT retry ok -> " + dstw);
             }
             break;
         }
@@ -1316,13 +1350,13 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
 
     if (r == INVALID_SOCKET) {
         stats->socks_fail.fetch_add(1);
-        log(L"[exp] #" + std::to_wstring(flow_id) + L" SOCKS5 CONNECT 失败 (" +
-            FromUtf8(err) + L", 总 " + std::to_wstring(dial_ms) +
+        WarnLog(log, L"[exp] #" + std::to_wstring(flow_id) + L" SOCKS5 CONNECT failed (" +
+            FromUtf8(err) + L", total " + std::to_wstring(dial_ms) +
             L"ms | tcp " + std::to_wstring(tm.tcp_ms) +
-            L"ms / 认证 " + std::to_wstring(tm.auth_ms) +
+            L"ms / auth " + std::to_wstring(tm.auth_ms) +
             L"ms / CONNECT " + std::to_wstring(tm.connect_ms) +
-            L"ms | 本地源 " + IpW(local_ip) + L") → " + dstw +
-            L" → 向应用发送 RST");
+            L"ms | local src " + IpW(local_ip) + L") -> " + dstw +
+            L" -> RST sent to app");
         // ProxyBridge reset_close: fail FAST so the app reconnects instead of
         // waiting out its own 5 s timeout.
         s->want_reset.store(true);
@@ -1341,8 +1375,9 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     ConfigureRelaySocket(s->client.load(), true);
     ConfigureRelaySocket(r, true);
     s->start = t0;
-    log(L"[exp] #" + std::to_wstring(flow_id) + L" 手机已接通 → " + dstw +
-        L" (CONNECT " + std::to_wstring(dial_ms) + L"ms)");
+    if (g_flow_log.load())
+        log(L"[exp] #" + std::to_wstring(flow_id) + L" phone connected -> " +
+            dstw + L" (CONNECT " + std::to_wstring(dial_ms) + L"ms)");
     std::thread t1(Pump, s.get(), 0);
     std::thread t2(Pump, s.get(), 1);
     t1.join();
@@ -1361,29 +1396,37 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     std::wstring why;
     if (up == 0 && down == 0) {
         stats->tcp_zero_close.fetch_add(1);
-        why = L"零字节·应用或手机立即关闭";
+        why = L"zero-byte, app or phone closed immediately";
     } else if (eof == 1) {
         stats->tcp_eof_remote.fetch_add(1);
-        why = L"手机侧先关闭";
+        why = L"phone closed first";
     } else if (eof == 0) {
         stats->tcp_eof_app.fetch_add(1);
-        why = L"应用侧先关闭";
+        if (up >= 300 && down < 100) {
+            stats->tcp_silent_target.fetch_add(1);
+            why = L"app closed first (target silent: no reply to request)";
+        } else {
+            why = L"app closed first";
+        }
     } else {
-        why = L"双向硬关闭";
+        why = L"both sides hard-closed";
     }
     // Structured close report requested by the architecture review: without
     // the per-direction WSA error it is impossible to tell the phone, the
     // remote server and the local reflection apart.
-    log(L"[exp] #" + std::to_wstring(flow_id) + L" TCP 结束 目标=" + dstw +
-        L" CONNECT=" + std::to_wstring(dial_ms) + L"ms 持续=" +
-        std::to_wstring(total_ms) + L"ms 上行=" + HUMAN_BYTES(up) +
-        L" 下行=" + HUMAN_BYTES(down));
-    log(L"[exp] #" + std::to_wstring(flow_id) + L"   APP→手机: " +
+    if (g_flow_log.load())
+    log(L"[exp] #" + std::to_wstring(flow_id) + L" TCP closed dst=" + dstw +
+        L" CONNECT=" + std::to_wstring(dial_ms) + L"ms duration=" +
+        std::to_wstring(total_ms) + L"ms up=" + HUMAN_BYTES(up) +
+        L" down=" + HUMAN_BYTES(down));
+    if (g_flow_log.load())
+    log(L"[exp] #" + std::to_wstring(flow_id) + L"   APP->phone: " +
         CloseReasonName(r0) + L" err=" + std::to_wstring(e0) + L" @" +
-        std::to_wstring(s->close_ms[0].load()) + L"ms | 手机→APP: " +
+        std::to_wstring(s->close_ms[0].load()) + L"ms | phone->APP: " +
         CloseReasonName(r1) + L" err=" + std::to_wstring(e1) + L" @" +
         std::to_wstring(s->close_ms[1].load()) + L"ms");
-    log(L"[exp] #" + std::to_wstring(flow_id) + L"   结束原因: " + why);
+    if (g_flow_log.load())
+    log(L"[exp] #" + std::to_wstring(flow_id) + L"   close: " + why);
     SessionFinalize(s, reg, stats, budget);
 }
 
@@ -1458,10 +1501,10 @@ void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
         // kept growing. Detect it and let the next datagram rebuild.
         if (!ExpSocks5UdpCtrlAlive(sess->assoc)) {
             stats->udp_assoc_dead.fetch_add(1);
-            log(L"[exp] UDP ASSOCIATE 控制连接已关闭 → 会话 " +
+            WarnLog(log, L"[exp] UDP ASSOCIATE control connection closed -> session " +
                 IpW(sess->app_ip) + L":" +
                 std::to_wstring(ntohs(sess->app_port)) +
-                L" 将自动重建（不再静默变成只发不收）");
+                L" will be rebuilt (no silent half-duplex)");
             break;
         }
         uint32_t sip = 0;
@@ -1511,7 +1554,7 @@ void UdpRecvThread(HANDLE divert, WD wd, std::shared_ptr<UdpSession> sess,
         // `udp_reply` used to be incremented only on a successful global
         // injection, mixed with TCP reflection/DNS replies; split it out so
         // "发送 N / 回包 N" can be read as a real UDP round-trip census.
-        if (WdInject(divert, wd, pkt.data(), (UINT)psz, &addr, L"UDP 回包", 0,
+        if (WdInject(divert, wd, pkt.data(), (UINT)psz, &addr, L"UDP reply", 0,
                      stats, log)) {
             stats->udp_reply.fetch_add(1);
             stats->udp_inject_ok.fetch_add(1);
@@ -1562,10 +1605,10 @@ void UdpAssociateWorker(std::shared_ptr<UdpSession> sess, std::string phone8,
         // Rate-limit: first 3 failures, then every 20th — otherwise a phone
         // without UDP support would flood the UI once per datagram.
         if (f <= 3 || f % 20 == 0) {
-            log(L"[exp] UDP ASSOCIATE 失败 #" + std::to_wstring(f) + L" (" +
+            WarnLog(log, L"[exp] UDP ASSOCIATE failed #" + std::to_wstring(f) + L" (" +
                 FromUtf8(err) + L", " + std::to_wstring(ms) +
-                L"ms) — fail-closed 丢弃，绝不直连放行；" +
-                std::to_wstring(backoff_ms) + L"ms 后重试");
+                L"ms) - fail-closed drop, never direct-egress;" +
+                std::to_wstring(backoff_ms) + L"ms, retrying");
         }
         stats->udp_drop.fetch_add(1);
         return;
@@ -1595,10 +1638,11 @@ void UdpAssociateWorker(std::shared_ptr<UdpSession> sess, std::string phone8,
             stats->udp_drop.fetch_add(1);
         }
     }
-    log(L"[exp] UDP 会话就绪 (" + std::to_wstring(ms) + L"ms) " +
+    if (g_flow_log.load())
+    log(L"[exp] UDP session ready (" + std::to_wstring(ms) + L"ms) " +
         IpW(sess->app_ip) + L":" + std::to_wstring(ntohs(sess->app_port)) +
-        L" 首包已转发 " + std::to_wstring(flushed) + L"/" +
-        std::to_wstring(q.size()) + L"；抓包线程未被阻塞");
+        L" first packet forwarded " + std::to_wstring(flushed) + L"/" +
+        std::to_wstring(q.size()) + L"; capture thread not blocked");
 }
 
 // ---------------------------------------------------- DNS adapter backup
@@ -1683,13 +1727,13 @@ bool EnsureFirewallInboundRule(std::wstring* detail) {
         CloseHandle(tok);
     }
     if (!elevated) {
-        *detail = L"未提权 → 跳过（Public 配置文件的入站 SYN 可能被防火墙丢弃）";
+        *detail = L"not elevated -> skipped (Public profile may drop inbound SYN)";
         return false;
     }
     wchar_t exe[MAX_PATH]{};
     DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) {
-        *detail = L"取 exe 路径失败";
+        *detail = L"cannot resolve exe path";
         return false;
     }
     unsigned h = 2166136261u;
@@ -1702,7 +1746,7 @@ bool EnsureFirewallInboundRule(std::wstring* detail) {
     swprintf(name, 96, L"LinkHelm-exp relay %08x", h);
     std::wstring rname(name);
     if (RunNetsh(L"advfirewall firewall show rule name=\"" + rname + L"\"")) {
-        *detail = L"规则已存在";
+        *detail = L"rule already exists";
         return true;
     }
     bool ok = RunNetsh(
@@ -1710,7 +1754,7 @@ bool EnsureFirewallInboundRule(std::wstring* detail) {
         L"\" dir=in action=allow program=\"" + std::wstring(exe) +
         L"\" enable=yes profile=any description=\"LinkHelm-exp local relay "
         L"inbound allow (all profiles)\"");
-    *detail = ok ? L"已添加全配置文件入站放行规则" : L"添加失败（检查权限/防火墙服务）";
+    *detail = ok ? L"inbound allow rule added for all profiles" : L"add failed (check privileges/firewall service)";
     return ok;
 }
 
@@ -1783,10 +1827,10 @@ bool HasPublicDns(const DnsBackup& b) {
 // F05: engine life-cycle names for the 10s statistics line.
 const wchar_t* StateName(int s) {
     switch (s) {
-        case 0: return L"启动中";
-        case 1: return L"运行中";
-        case 2: return L"故障";
-        default: return L"已停止";
+        case 0: return L"starting";
+        case 1: return L"running";
+        case 2: return L"FAULTED";
+        default: return L"stopped";
     }
 }
 
@@ -1844,9 +1888,9 @@ struct ExpEngine::Impl {
             last_fatal = why;
         }
         state.store(kFaulted);
-        log(L"[exp] ENGINE_FAULT 状态=FAULTED 原因=" + why +
-            L"（捕获线程已停止，其它线程将被协调退出）");
-        status(L"故障：" + why + L"（请断开后重连）");
+        log(L"[exp] ENGINE_FAULT state=FAULTED reason=" + why +
+            L"(capture thread stopped, other threads exiting)");
+        status(L"FAULTED: " + why + L"(disconnect and reconnect)");
     }
 
     ExpAuth auth;
@@ -1886,7 +1930,7 @@ void ExpEngine::Impl::AcceptLoop() {
         SOCKET cs = accept(listener, reinterpret_cast<sockaddr*>(&ca), &cl);
         if (cs == INVALID_SOCKET) continue;
         if (tcp_budget.load() >= 400) {
-            log(L"[exp] TCP 会话数达上限 400，拒绝新连接（背压）");
+            WarnLog(log, L"[exp] TCP session cap 400 reached, refusing new flow (backpressure)");
             closesocket(cs);
             continue;
         }
@@ -1898,7 +1942,7 @@ void ExpEngine::Impl::AcceptLoop() {
             std::lock_guard<std::mutex> lk(nat_mtx);
             auto it = nat.find(key);
             if (it == nat.end()) {
-                log(L"[exp] 无 NAT 表项，拒绝连接（伪造/过期的反射连接）");
+                WarnLog(log, L"[exp] no NAT entry, connection refused (forged/stale reflected flow)");
                 closesocket(cs);
                 continue;
             }
@@ -1977,14 +2021,16 @@ void ExpEngine::Impl::AuditTcpTakeover() {
     stats->audit_managed.store(managed);
     stats->audit_unmanaged.store(unmanaged);
     if (unmanaged > 0) {
-        log(L"[exp] 接管审计: 本机公网 TCP 已建立 " +
-            std::to_wstring(total) + L" 条 | 经本引擎 " +
-            std::to_wstring(managed) + L" 条 | 未代理 " +
+        if (g_flow_log.load())
+        log(L"[exp] takeover audit: local public TCP established " +
+            std::to_wstring(total) + L" flows | via engine " +
+            std::to_wstring(managed) + L" flows | unmanaged " +
             std::to_wstring(unmanaged) +
-            L" 条 → 这些连接由系统直连出站，出口 IP 会与手机不一致：" + detail);
+            L" flows -> direct egress, IP differs from phone: " + detail);
     } else {
-        log(L"[exp] 接管审计: 本机公网 TCP 已建立 " +
-            std::to_wstring(total) + L" 条 | 全部经本引擎（未代理 0）");
+        if (g_flow_log.load())
+        log(L"[exp] takeover audit: local public TCP established " +
+            std::to_wstring(total) + L" flows | all via engine (unmanaged 0)");
     }
 }
 
@@ -2051,7 +2097,7 @@ void ExpEngine::Impl::ExpireLoop() {
             if (s->state.load() == kUdpReady) ExpSocks5UdpClose(&s->assoc);
         }
         // plan §5.3: aggregate session-closure evidence every ~10s
-        if (ticks % 10 == 0) {
+        if (ticks % g_stats_interval_s.load() == 0) {
             AuditTcpTakeover();   // independent, OS-table-based proof
             const wchar_t* st = StateName(state.load());
             // Handshake latency distribution: if p95 is in seconds the
@@ -2067,70 +2113,90 @@ void ExpEngine::Impl::ExpireLoop() {
                     cmax = v.back();
                 }
             }
-            log(L"[exp] 统计[" + std::wstring(st) + L"]: TCP 活动 " +
-                std::to_wstring(tcp_budget.load()) +
-                L" | 成功 " + std::to_wstring(stats->socks_ok.load()) +
-                L" 失败 " + std::to_wstring(stats->socks_fail.load()) +
-                L" 重试 " + std::to_wstring(stats->connect_retry.load()) +
-                L" 重试成功 " + std::to_wstring(stats->connect_retry_ok.load()) +
-                L" | ↑" + HUMAN_BYTES(stats->bytes_up.load()) +
-                L" ↓" + HUMAN_BYTES(stats->bytes_down.load()) +
-                L" | 捕获 " + std::to_wstring(stats->recv_ok.load()) +
-                L" 收包错误 " + std::to_wstring(stats->recv_err.load()) +
-                L" | 回注 成功 " + std::to_wstring(stats->inject_ok.load()) +
-                L" 失败 " + std::to_wstring(stats->inject_fail.load()) +
-                L" | DNS 成功 " + std::to_wstring(stats->dns_ok.load()) +
-                L" 失败 " + std::to_wstring(stats->dns_fail.load()) +
-                L" | UDP 就绪 " + std::to_wstring(stats->udp_assoc_ok.load()) +
-                L" 握手失败 " + std::to_wstring(stats->udp_assoc_fail.load()) +
-                L" 发送 " + std::to_wstring(stats->udp_sent.load()) +
-                L" 回包 " + std::to_wstring(stats->udp_reply.load()) +
-                L" 丢弃 " + std::to_wstring(stats->udp_drop.load()) +
-                L" 异常跳过 " + std::to_wstring(stats->udp_reply_bad.load()) +
-                L" 会话重建 " + std::to_wstring(stats->udp_assoc_dead.load()) +
-                L" | UDP443 代理 " + std::to_wstring(stats->udp443_seen.load()) +
-                L" | NAT 碰撞 " + std::to_wstring(stats->nat_collision.load()) +
-                L" | DNS 池复用失败 " +
-                std::to_wstring(stats->dns_pool_reuse_fail.load()) +
-                L" 重拨成功 " + std::to_wstring(stats->dns_pool_redial_ok.load()) +
-                L" 缓存命中 " + std::to_wstring(stats->dns_cache_hit.load()) +
-                L" 过期回源 " + std::to_wstring(stats->dns_stale_served.load()) +
-                L" 环回重置 " + std::to_wstring(stats->dns_loop_reset.load()) +
-                L" 接收致命错 " + std::to_wstring(stats->dns_loop_fatal.load()) +
-                L" | DNS 上游连不上 " +
-                std::to_wstring(stats->dns_up_connect_fail.load()) +
-                L" 发送失败 " + std::to_wstring(stats->dns_up_send_fail.load()) +
-                L" 接收失败 " + std::to_wstring(stats->dns_up_recv_fail.load()) +
-                L" | IPv6 阻断 " + std::to_wstring(stats->ipv6_drop.load()) +
-                L" | UDP 捕获 " + std::to_wstring(stats->udp_capture.load()) +
-                L" 局域网 " + std::to_wstring(stats->udp_lan_pass.load()) +
-                L" 代理 " + std::to_wstring(stats->udp_proxy.load()) +
-                L" | CONNECT p50 " + std::to_wstring(p50) +
-                L" p95 " + std::to_wstring(p95) +
-                L" 最大 " + std::to_wstring(cmax) + L"ms" +
-                L" | 零字节关闭 " + std::to_wstring(stats->tcp_zero_close.load()) +
-                L" 手机先关 " + std::to_wstring(stats->tcp_eof_remote.load()) +
-                L" 应用先关 " + std::to_wstring(stats->tcp_eof_app.load()) +
-                L" RST(应用/手机) " + std::to_wstring(stats->close_rst_app.load()) +
-                L"/" + std::to_wstring(stats->close_rst_remote.load()) +
-                L" 写失败 " + std::to_wstring(stats->close_send_fail.load()) +
-                L" | UDP 回注 " + std::to_wstring(stats->udp_inject_ok.load()) +
-                L"/失败 " + std::to_wstring(stats->udp_inject_fail.load()) +
-                L" | SYN 重置 " + std::to_wstring(stats->nat_syn_reset.load()) +
-                L" SYN重传 " + std::to_wstring(stats->nat_syn_retransmit.load()) +
-                L" FIN/RST 退休 " + std::to_wstring(stats->nat_fin_retire.load()) +
-                L" 孤儿丢弃 " + std::to_wstring(stats->nat_orphan_drop.load()) +
-                L" 代理端点放行 " + std::to_wstring(stats->endpoint_bypass.load()) +
-                L" | 阻断 " + std::to_wstring(stats->blocked.load()) +
-                L" | DNS状态 " +
-                (dns_ready ? L"就绪(127.0.0.1:53)"
-                           : L"降级(走WinDivert拦截)") +
-                L" | 未代理泄漏 " + std::to_wstring(stats->leak.load()) +
-                L"（应为 0） | 接管审计 经引擎 " +
-                std::to_wstring(stats->audit_managed.load()) + L"/" +
-                std::to_wstring(stats->audit_total.load()) +
-                L" 未代理 " + std::to_wstring(stats->audit_unmanaged.load()) +
-                L"（应为 0）");
+            if (!g_flow_log.load()) {
+                log(L"[exp] stats[" + std::wstring(st) + L"]: TCP " +
+                    std::to_wstring(tcp_budget.load()) + L" active | ok " +
+                    std::to_wstring(stats->socks_ok.load()) + L" fail " +
+                    std::to_wstring(stats->socks_fail.load()) +
+                    L" | DNS ok " + std::to_wstring(stats->dns_ok.load()) +
+                    L" fail " + std::to_wstring(stats->dns_fail.load()) +
+                    L" | app-closed " + std::to_wstring(stats->tcp_eof_app.load()) +
+                    L" phone-closed " + std::to_wstring(stats->tcp_eof_remote.load()) +
+                    L" zero-byte " + std::to_wstring(stats->tcp_zero_close.load()) +
+                    L" silent-target " + std::to_wstring(stats->tcp_silent_target.load()) +
+                    L" | CONNECT p50 " + std::to_wstring(p50) +
+                    L"ms p95 " + std::to_wstring(p95) + L"ms" +
+                    L" | UDP ready " + std::to_wstring(stats->udp_assoc_ok.load()) +
+                    L" fail " + std::to_wstring(stats->udp_assoc_fail.load()) +
+                    L" | leak " + std::to_wstring(stats->leak.load()) +
+                    L" orphan-drop " + std::to_wstring(stats->nat_orphan_drop.load()));
+            } else {
+                log(L"[exp] stats[" + std::wstring(st) + L"]: TCP active " +
+                    std::to_wstring(tcp_budget.load()) +
+                    L" | ok " + std::to_wstring(stats->socks_ok.load()) +
+                    L" fail " + std::to_wstring(stats->socks_fail.load()) +
+                    L" retry " + std::to_wstring(stats->connect_retry.load()) +
+                    L" retry ok " + std::to_wstring(stats->connect_retry_ok.load()) +
+                    L" | tx" + HUMAN_BYTES(stats->bytes_up.load()) +
+                    L" rx" + HUMAN_BYTES(stats->bytes_down.load()) +
+                    L" | captured " + std::to_wstring(stats->recv_ok.load()) +
+                    L" recv-err " + std::to_wstring(stats->recv_err.load()) +
+                    L" | inject ok " + std::to_wstring(stats->inject_ok.load()) +
+                    L" fail " + std::to_wstring(stats->inject_fail.load()) +
+                    L" | DNS ok " + std::to_wstring(stats->dns_ok.load()) +
+                    L" fail " + std::to_wstring(stats->dns_fail.load()) +
+                    L" | UDP ready " + std::to_wstring(stats->udp_assoc_ok.load()) +
+                    L" handshake-fail " + std::to_wstring(stats->udp_assoc_fail.load()) +
+                    L" sent " + std::to_wstring(stats->udp_sent.load()) +
+                    L" replies " + std::to_wstring(stats->udp_reply.load()) +
+                    L" dropped " + std::to_wstring(stats->udp_drop.load()) +
+                    L" malformed-skip " + std::to_wstring(stats->udp_reply_bad.load()) +
+                    L" session rebuilt " + std::to_wstring(stats->udp_assoc_dead.load()) +
+                    L" | UDP443 proxied " + std::to_wstring(stats->udp443_seen.load()) +
+                    L" | NAT collision " + std::to_wstring(stats->nat_collision.load()) +
+                    L" | DNS pool reuse fail " +
+                    std::to_wstring(stats->dns_pool_reuse_fail.load()) +
+                    L" redial ok " + std::to_wstring(stats->dns_pool_redial_ok.load()) +
+                    L" cache hit " + std::to_wstring(stats->dns_cache_hit.load()) +
+                    L" stale served " + std::to_wstring(stats->dns_stale_served.load()) +
+                    L" loopback reset " + std::to_wstring(stats->dns_loop_reset.load()) +
+                    L" recv-fatal " + std::to_wstring(stats->dns_loop_fatal.load()) +
+                    L" | DNS upstream unreachable " +
+                    std::to_wstring(stats->dns_up_connect_fail.load()) +
+                    L" send-fail " + std::to_wstring(stats->dns_up_send_fail.load()) +
+                    L" recv-fail " + std::to_wstring(stats->dns_up_recv_fail.load()) +
+                    L" | IPv6 blocked " + std::to_wstring(stats->ipv6_drop.load()) +
+                    L" | UDP captured " + std::to_wstring(stats->udp_capture.load()) +
+                    L" LAN " + std::to_wstring(stats->udp_lan_pass.load()) +
+                    L" proxied " + std::to_wstring(stats->udp_proxy.load()) +
+                    L" | CONNECT p50 " + std::to_wstring(p50) +
+                    L" p95 " + std::to_wstring(p95) +
+                    L" max " + std::to_wstring(cmax) + L"ms" +
+                    L" | zero-byte close " + std::to_wstring(stats->tcp_zero_close.load()) +
+                    L" phone-closed " + std::to_wstring(stats->tcp_eof_remote.load()) +
+                    L" app-closed " + std::to_wstring(stats->tcp_eof_app.load()) +
+                    L" silent-target " + std::to_wstring(stats->tcp_silent_target.load()) +
+                    L" RST(app/phone) " + std::to_wstring(stats->close_rst_app.load()) +
+                    L"/" + std::to_wstring(stats->close_rst_remote.load()) +
+                    L" write-fail " + std::to_wstring(stats->close_send_fail.load()) +
+                    L" | UDP inject " + std::to_wstring(stats->udp_inject_ok.load()) +
+                    L"/fail " + std::to_wstring(stats->udp_inject_fail.load()) +
+                    L" | SYN reset " + std::to_wstring(stats->nat_syn_reset.load()) +
+                    L" SYN retransmit " + std::to_wstring(stats->nat_syn_retransmit.load()) +
+                    L" FIN/RST retired " + std::to_wstring(stats->nat_fin_retire.load()) +
+                    L" orphan-drop " + std::to_wstring(stats->nat_orphan_drop.load()) +
+                    L" proxy endpoint bypass " + std::to_wstring(stats->endpoint_bypass.load()) +
+                    L" | blocked " + std::to_wstring(stats->blocked.load()) +
+                    L" | DNS state " +
+                    (dns_ready ? L"ready (127.0.0.1:53)"
+                               : L"degraded (WinDivert interception)") +
+                    L" | leak " + std::to_wstring(stats->leak.load()) +
+                    L" (expected 0) | takeover audit via engine " +
+                    std::to_wstring(stats->audit_managed.load()) + L"/" +
+                    std::to_wstring(stats->audit_total.load()) +
+                    L" unmanaged " + std::to_wstring(stats->audit_unmanaged.load()) +
+                    L"(expected 0)");
+            }
         }
     }
 }
@@ -2149,9 +2215,9 @@ void ExpEngine::Impl::MainLoop() {
             // UI is told explicitly, and every waiting worker is released.
             if (running.load()) {
                 running.store(false);
-                SetFault(L"WinDivert 捕获已停止 (err=" +
+                SetFault(L"WinDivert capture stopped (err=" +
                          std::to_wstring((unsigned long long)e) +
-                         L")，数据面不再转发");
+                         L") - data plane no longer forwarding");
             }
             break;
         }
@@ -2188,7 +2254,7 @@ void ExpEngine::Impl::MainLoop() {
             // global IPv6 to force a clean IPv4 fallback (AAAA is also
             // suppressed in the local DNS proxy).
             if (!ip6 || !addr.Outbound || IsIpv6Local(ip6->DstAddr)) {
-                WdInject(divert, wd, pkt.data(), len, &addr, L"IPv6 本地放行", 0,
+                WdInject(divert, wd, pkt.data(), len, &addr, L"IPv6 local pass", 0,
                          stats, log);
                 continue;
             }
@@ -2197,7 +2263,7 @@ void ExpEngine::Impl::MainLoop() {
                 // speaks ATYP=IPv4, so this is a DIRECT pass-through and will
                 // show up as an unproxied egress — that is the experiment.
                 WdInject(divert, wd, pkt.data(), len, &addr,
-                         L"IPv6 策略放行(测试)", 0, stats, log);
+                         L"IPv6 policy pass (test)", 0, stats, log);
                 continue;
             }
             stats->ipv6_drop.fetch_add(1);
@@ -2231,9 +2297,9 @@ void ExpEngine::Impl::MainLoop() {
             // source so the app's socket still matches.
             uint32_t up = PickDnsUpstream(dst_ip, phone_net);
             if (up != dst_ip && !dns_remap_logged.exchange(true)) {
-                log(L"[exp] DNS 上游重定向: " + IpW(dst_ip) +
-                    L":53 为手机/私网地址，改用 " + IpW(up) + L":53（回包仍以 " +
-                    IpW(dst_ip) + L" 为源）");
+                WarnLog(log, L"[exp] DNS upstream redirect: " + IpW(dst_ip) +
+                    L":53 is phone/private, using " + IpW(up) + L":53 (reply still sourced from " +
+                    IpW(dst_ip) + L" as source)");
             }
             std::atomic<int>* db = &dns_budget;
             auto st = stats;
@@ -2297,7 +2363,7 @@ void ExpEngine::Impl::MainLoop() {
         }
         if (socks_ctrl || socks_ctrl_rev || socks_udp) {
             stats->endpoint_bypass.fetch_add(1);
-            WdInject(divert, wd, pkt.data(), len, &addr, L"代理端点放行", 0,
+            WdInject(divert, wd, pkt.data(), len, &addr, L"proxy endpoint bypass", 0,
                      stats, log);
             continue;
         }
@@ -2322,7 +2388,7 @@ void ExpEngine::Impl::MainLoop() {
                     // no longer lose its mapping in the first place.
                     uint64_t n = stats->nat_orphan_drop.fetch_add(1) + 1;
                     if (n <= 3)
-                        log(L"[exp] 孤儿反射包丢弃（映射已消失）" +
+                        WarnLog(log, L"[exp] orphan reflected packet dropped (mapping gone)" +
                             IpW(dst_ip) + L":" +
                             std::to_wstring(ntohs(dport)));
                     continue;
@@ -2344,7 +2410,7 @@ void ExpEngine::Impl::MainLoop() {
             addr.Network.IfIdx = entry.if_idx;
             addr.Network.SubIfIdx = entry.sub_if_idx;
             wd.checksums(pkt.data(), len, &addr, 0);
-            WdInject(divert, wd, pkt.data(), len, &addr, L"回环反射", 0, stats,
+            WdInject(divert, wd, pkt.data(), len, &addr, L"loopback reflection", 0, stats,
                      log);
             continue;
         }
@@ -2352,7 +2418,7 @@ void ExpEngine::Impl::MainLoop() {
         // ---- policy: never capture LAN/multicast/broadcast ----
         if (IsBypassDst(dst_ip)) {
             if (udph) stats->udp_lan_pass.fetch_add(1);
-            WdInject(divert, wd, pkt.data(), len, &addr, L"局域网放行", 0, stats,
+            WdInject(divert, wd, pkt.data(), len, &addr, L"LAN pass", 0, stats,
                      log);
             continue;
         }
@@ -2426,15 +2492,15 @@ void ExpEngine::Impl::MainLoop() {
             if (collision) {
                 uint64_t n = stats->nat_collision.fetch_add(1) + 1;
                 if (n <= 3)
-                    log(L"[exp] NAT 键碰撞: 拒绝复用 本机=" +
+                    WarnLog(log, L"[exp] NAT key collision: reuse refused local=" +
                         IpW(iph->SrcAddr) + L":" +
-                        std::to_wstring(ntohs(sport)) + L" → 目标=" +
+                        std::to_wstring(ntohs(sport)) + L" -> dst=" +
                         IpW(dst_ip) + L":" +
                         std::to_wstring(ntohs(dport)) +
-                        L"；既有映射 目标=" + IpW(htonl(entry.orig_dst_ip)) +
+                        L"; existing mapping dst=" + IpW(htonl(entry.orig_dst_ip)) +
                         L":" + std::to_wstring(entry.orig_dst_port) +
-                        L" 本机=" + IpW(entry.app_ip) +
-                        L"（完整五元组不一致），该包丢弃");
+                        L" local=" + IpW(entry.app_ip) +
+                        L"(full 5-tuple mismatch), packet dropped");
                 stats->blocked.fetch_add(1);
                 continue;
             }
@@ -2460,9 +2526,10 @@ void ExpEngine::Impl::MainLoop() {
                     std::lock_guard<std::mutex> lk(nat_mtx);
                     nat[key] = entry;
                 }
-                log(L"[exp] #" + std::to_wstring(flow_id) + L" 捕获 TCP " +
+                if (g_flow_log.load())
+                log(L"[exp] #" + std::to_wstring(flow_id) + L" TCP captured " +
                     IpW(iph->SrcAddr) + L":" +
-                    std::to_wstring(ntohs(sport)) + L" → " +
+                    std::to_wstring(ntohs(sport)) + L" -> " +
                     IpW(dst_ip) + L":" + std::to_wstring(ntohs(dport)));
             }
             // Address reflection: the packet becomes INBOUND from the orig
@@ -2477,7 +2544,7 @@ void ExpEngine::Impl::MainLoop() {
             addr.Network.IfIdx = entry.if_idx;
             addr.Network.SubIfIdx = entry.sub_if_idx;
             wd.checksums(pkt.data(), len, &addr, 0);
-            WdInject(divert, wd, pkt.data(), len, &addr, L"TCP 反射", entry.flow_id,
+            WdInject(divert, wd, pkt.data(), len, &addr, L"TCP reflection", entry.flow_id,
                      stats, log);
             continue;
         }
@@ -2494,11 +2561,11 @@ void ExpEngine::Impl::MainLoop() {
             if (IsQuicPort(ntohs(dport))) {
                 uint64_t n = stats->udp443_seen.fetch_add(1) + 1;
                 if (n == 1)
-                    log(L"[exp] 策略: 检测到 UDP/443（QUIC 或游戏流量）— " +
+                    WarnLog(log, L"[exp] policy: UDP/443 seen (QUIC or game traffic) - " +
                         std::wstring(policy.udp443_drop
-                            ? L"exp_policy.ini Udp443=drop → 显式丢弃"
-                            : L"交给 SOCKS5 UDP ASSOCIATE 转发；"
-                              L"若手机不支持则 fail-closed 丢弃并计入统计"));
+                            ? L"exp_policy.ini Udp443=drop -> explicit discard"
+                            : L"handed to SOCKS5 UDP ASSOCIATE;"
+                              L"fail-closed drop and count if phone does not support it"));
                 if (policy.udp443_drop) {
                     stats->udp_drop.fetch_add(1);
                     continue;   // opt-in compatibility switch, never default
@@ -2629,21 +2696,25 @@ ExpEngine::~ExpEngine() { Stop(); }
 bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     Impl* I = impl_.get();
     if (I->running.load()) {
-        if (error) *error = L"引擎已在运行";
+        if (error) *error = L"engine already running";
         return false;
     }
     I->cfg = cfg;
     I->state.store(Impl::kStarting);
     I->policy = LoadPolicy();
+    // Publish detached-worker switches. Workers must never read Impl after
+    // Stop(), so every global is copied out here exactly once.
+    g_flow_log.store(I->policy.flow_log);
+    g_stats_interval_s.store(I->policy.stats_interval_s);
     I->dnsproxy.aaaa_suppress.store(I->policy.aaaa_suppress);
-    I->log(L"[exp] 策略: UDP443=" +
+    I->log(L"[exp] policy: UDP443=" +
            std::wstring(I->policy.udp443_drop ? L"drop" : L"proxy") +
            L" IPv6=" +
-           (I->policy.ipv6_allow ? L"allow(测试)" : L"block") +
+           (I->policy.ipv6_allow ? L"allow (test)" : L"block") +
            L" AAAA=" +
-           (I->policy.aaaa_suppress ? L"suppress" : L"allow(测试)") +
-           L" 防火墙入站=" +
-           (I->policy.firewall_allow ? L"允许添加" : L"仅检测"));
+           (I->policy.aaaa_suppress ? L"suppress" : L"allow (test)") +
+           L" firewall inbound=" +
+           (I->policy.firewall_allow ? L"allow add" : L"detect only"));
     if (I->policy.firewall_allow) {
         std::wstring fw;
         EnsureFirewallInboundRule(&fw);
@@ -2653,30 +2724,30 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     I->auth.user = ToUtf8(cfg.socks_user);
     I->auth.pass = ToUtf8(cfg.socks_pass);
     if (I->phone8.empty() || cfg.phone_port <= 0) {
-        if (error) *error = L"手机 IP/端口无效";
+        if (error) *error = L"invalid phone IP/port";
         return false;
     }
 
-    I->status(L"加载 WinDivert…");
+    I->status(L"Loading WinDivert...");
     if (!LoadWinDivert(&I->wd, error)) return false;
 
     // --- SOCKS5 precheck: fail fast with a specific message ---
-    I->status(L"检测手机 SOCKS5 认证…");
+    I->status(L"Checking phone SOCKS5 auth...");
     std::string perr;
     if (!ExpSocks5Precheck(I->phone8,
                            static_cast<uint16_t>(cfg.phone_port), I->auth,
                            &perr)) {
-        if (error) *error = L"手机 SOCKS5 预检失败: " + FromUtf8(perr);
+        if (error) *error = L"phone SOCKS5 preflight failed: " + FromUtf8(perr);
         return false;
     }
-    I->log(L"[exp] SOCKS5 认证通过 " + cfg.phone_ip + L":" +
+    I->log(L"[exp] SOCKS5 auth ok " + cfg.phone_ip + L":" +
            std::to_wstring(cfg.phone_port));
 
     // --- G0 gate (plan §11): verify the phone can actually REACH the
     // Internet — a full SOCKS5 CONNECT through the phone to a public DNS
     // endpoint. Auth alone proves nothing about egress. If this fails,
     // WinDivert capture would only create a soft black hole.
-    I->status(L"验证手机出口连通（G0）…");
+    I->status(L"Verifying phone egress (G0)...");
     {
         auto t0 = std::chrono::steady_clock::now();
         std::string gerr;
@@ -2686,17 +2757,17 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
             dns_ip, htons(53), &gerr);
         if (g == INVALID_SOCKET) {
             if (error)
-                *error = L"G0 出口验证失败：手机无法经 SOCKS5 访问公网 (" +
+                *error = L"G0 egress check FAILED: phone cannot reach public net via SOCKS5 (" +
                          FromUtf8(gerr) +
-                         L")。请先确认手机数据/上行走廊正常，再启动透明代理。";
+                         L") Verify phone data/uplink before starting the transparent proxy.";
             return false;
         }
         closesocket(g);
         int ms = static_cast<int>(std::chrono::duration_cast<
             std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
             .count());
-        I->log(L"[exp] G0 出口验证通过（CONNECT 223.5.5.5:53, " +
-               std::to_wstring(ms) + L"ms）— 手机可出公网");
+        I->log(L"[exp] G0 egress check passed (CONNECT 223.5.5.5:53, " +
+               std::to_wstring(ms) + L"ms) - phone can reach public net");
     }
 
     // --- Route DIAGNOSTICS ONLY — the route table is NEVER mutated. ---
@@ -2712,9 +2783,9 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
         uint32_t phone_net = IpToNet(I->phone8);
         I->phone_net = phone_net;
         if (GetBestRoute(phone_net, 0, &phone_row) != NO_ERROR) {
-            I->log(L"[exp] 找不到到手机的路由 — 请先连接 Wi-Fi Direct");
-            if (error) *error = L"本机没有到手机 " + cfg.phone_ip +
-                                L" 的路由（Wi-Fi Direct 未连接？）";
+            I->log(L"[exp] no route to phone - connect Wi-Fi Direct first");
+            if (error) *error = L"no route to phone " + cfg.phone_ip +
+                                L" route (Wi-Fi Direct not connected?)";
             return false;
         }
         MIB_IPFORWARDROW inet_row{};
@@ -2725,20 +2796,20 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
             (inet_row.dwForwardIfIndex == phone_row.dwForwardIfIndex);
         I->uplink_if = (e == NO_ERROR) ? inet_row.dwForwardIfIndex : 0;
         std::wstring legacy = FindLegacyTunAdapter();
-        I->log(L"[exp] ENGINE_ROUTE_SNAPSHOT 外网出口 ifIndex=" +
+        I->log(L"[exp] ENGINE_ROUTE_SNAPSHOT internet egress ifIndex=" +
                std::to_wstring(I->uplink_if) +
-               L" / 手机链路 ifIndex=" +
+               L" / phone link ifIndex=" +
                std::to_wstring(phone_row.dwForwardIfIndex) +
                (I->phone_only_uplink
-                    ? L" — 同一接口"
-                    : L" — 存在其它默认上行") +
-               L" / 旧虚拟适配器=" +
-               (legacy.empty() ? L"未检测到" : L"「" + legacy + L"」") +
-               L"；公网流量全部由 WinDivert 接管，绝不直连放行，不修改路由表");
+                    ? L" - same interface"
+                    : L" - another default uplink exists") +
+               L" / legacy virtual adapter=" +
+               (legacy.empty() ? L"not detected" : L"'" + legacy + L"'") +
+               L"; all public traffic taken over by WinDivert, never direct-egress, routing table untouched");
         if (!legacy.empty())
-            I->log(L"[exp] ENGINE_BASELINE_WARN 检测到旧虚拟适配器「" + legacy +
-                   L"」仍在系统中，可能污染选路；EXP 只读报告、绝不改动，"
-                   L"请在验收前手动确认其默认路由");
+            I->log(L"[exp] ENGINE_BASELINE_WARN legacy virtual adapter '" + legacy +
+                   L"' still present, may affect routing; EXP reports read-only, never modifies, "
+                   L"verify its default route manually before acceptance");
     }
 
     // --- Local DNS proxy + point the phone adapter at 127.0.0.1.
@@ -2772,9 +2843,9 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
             if (WSAIoctl(I->dnsproxy.sock, SIO_UDP_CONNRESET,
                          &dis_connreset, sizeof(dis_connreset), nullptr, 0,
                          nullptr, nullptr, nullptr) == SOCKET_ERROR) {
-                I->log(L"[exp] DNS: SIO_UDP_CONNRESET 关闭失败 err=" +
+                I->log(L"[exp] DNS: failed to disable SIO_UDP_CONNRESET err=" +
                        std::to_wstring(WSAGetLastError()) +
-                       L"（接收线程将依赖容错分支存活）");
+                       L"(receive loop relies on tolerant branch)");
             }
             sockaddr_in la{};
             la.sin_family = AF_INET;
@@ -2784,8 +2855,8 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
                      sizeof(la)) == SOCKET_ERROR) {
                 closesocket(I->dnsproxy.sock);
                 I->dnsproxy.sock = INVALID_SOCKET;
-                I->log(L"[exp] DNS_DEGRADED: 本地 DNS 代理绑定 127.0.0.1:53 失败"
-                       L"（端口被占用？）— 系统解析将改走 WinDivert 拦截转发");
+                I->log(L"[exp] DNS_DEGRADED: cannot bind local DNS proxy 127.0.0.1:53"
+                       L"(port in use?) - system lookups fall back to WinDivert interception");
             } else {
                 I->dnsproxy.running.store(true);
                 I->dnsproxy_thr = std::thread(
@@ -2798,29 +2869,29 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
                 I->dns_backup.changed = ok;
                 if (ok) {
                     dns_ready = true;
-                    I->log(L"[exp] 本地 DNS 代理已启动 (127.0.0.1:53)，适配器「" +
+                    I->log(L"[exp] local DNS proxy up (127.0.0.1:53), adapter '" +
                            I->dns_backup.ifname +
-                           L"」DNS 已指向 127.0.0.1（断开恢复）");
+                           L"' DNS set to 127.0.0.1 (restored on stop)");
                 } else {
-                    I->log(L"[exp] DNS_DEGRADED: 127.0.0.1:53 已监听，但适配器「" +
-                           I->dns_backup.ifname + L"」DNS 设置失败 — "
-                           L"系统解析将改走 WinDivert 拦截转发");
+                    I->log(L"[exp] DNS_DEGRADED: 127.0.0.1:53 bound but adapter '" +
+                           I->dns_backup.ifname + L"' DNS config failed - "
+                           L"system lookups fall back to WinDivert interception");
                 }
             }
         } else {
-            I->log(L"[exp] DNS_DEGRADED: 创建本地 DNS 代理 socket 失败 — "
-                   L"系统解析将改走 WinDivert 拦截转发");
+            I->log(L"[exp] DNS_DEGRADED: local DNS socket creation failed - "
+                   L"system lookups fall back to WinDivert interception");
         }
     } else {
-        I->log(L"[exp] DNS_DEGRADED: 未找到手机适配器（按网关匹配失败）— "
-               L"系统解析将改走 WinDivert 拦截转发");
+        I->log(L"[exp] DNS_DEGRADED: phone adapter not found (gateway match failed) - "
+               L"system lookups fall back to WinDivert interception");
     }
     I->dns_ready = dns_ready;
 
     // --- local TCP listener (reflection target) ---
     I->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (I->listener == INVALID_SOCKET) {
-        if (error) *error = L"创建本地监听失败";
+        if (error) *error = L"local listener creation failed";
         return false;
     }
     sockaddr_in la{};
@@ -2830,7 +2901,7 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     if (bind(I->listener, reinterpret_cast<sockaddr*>(&la), sizeof(la)) ==
             SOCKET_ERROR ||
         listen(I->listener, SOMAXCONN) == SOCKET_ERROR) {
-        if (error) *error = L"本地监听 bind/listen 失败";
+        if (error) *error = L"local listener bind/listen failed";
         closesocket(I->listener);
         I->listener = INVALID_SOCKET;
         return false;
@@ -2862,20 +2933,20 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     // filter token on this WinDivert build.
     std::string filter = BuildCaptureFilter(I->phone8, I->local_port);
 
-    I->status(L"打开 WinDivert 捕获…");
+    I->status(L"Opening WinDivert capture...");
     HANDLE h = I->wd.open(filter.c_str(), WINDIVERT_LAYER_NETWORK, 0, 0);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
         std::wstring m;
         if (e == ERROR_ACCESS_DENIED)
-            m = L"需要管理员权限（WinDivertOpen ERROR_ACCESS_DENIED）";
+            m = L"administrator required (WinDivertOpen ERROR_ACCESS_DENIED)";
         else if (e == ERROR_SERVICE_EXISTS)
-            m = L"另一个 WinDivert 实例正在运行（优先级冲突）";
+            m = L"another WinDivert instance is running (priority conflict)";
         else if (e == ERROR_INVALID_PARAMETER)
-            m = L"过滤表达式无效";
+            m = L"invalid filter expression";
         else
-            m = L"WinDivertOpen 失败 err=" + std::to_wstring(e) +
-                L"（是否与其他 WFP/VPN 软件冲突？）";
+            m = L"WinDivertOpen failed err=" + std::to_wstring(e) +
+                L"(conflict with other WFP/VPN software?)";
         if (error) *error = m;
         closesocket(I->listener);
         I->listener = INVALID_SOCKET;
@@ -2885,17 +2956,17 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     I->running.store(true);
     I->state.store(Impl::kRunning);
     I->log(L"[exp] ENGINE_START phone=" + cfg.phone_ip + L":" +
-           std::to_wstring(cfg.phone_port) + L" 本地反射端口=" +
-           std::to_wstring(I->local_port) + L" 状态=STARTING→RUNNING");
+           std::to_wstring(cfg.phone_port) + L" local reflector port=" +
+           std::to_wstring(I->local_port) + L" state=STARTING->RUNNING");
 
     I->accept_thr = std::thread([I] { I->AcceptLoop(); });
     I->main_thr = std::thread([I] { I->MainLoop(); });
     I->expire_thr = std::thread([I] { I->ExpireLoop(); });
 
-    I->log(L"[exp] ENGINE_RUNNING 数据面已启动: WinDivert 拦截 → 本地反射:" +
-           std::to_wstring(I->local_port) + L" → SOCKS5 " + cfg.phone_ip +
-           L":" + std::to_wstring(cfg.phone_port) + L"（TCP+UDP）");
-    I->status(L"已连接（透明代理运行中 · 无虚拟网卡）");
+    I->log(L"[exp] ENGINE_RUNNING data plane up: WinDivert capture -> local reflection:" +
+           std::to_wstring(I->local_port) + L" -> SOCKS5 " + cfg.phone_ip +
+           L":" + std::to_wstring(cfg.phone_port) + L"(TCP+UDP)");
+    I->status(L"connected (transparent proxy running, no virtual adapter)");
     return true;
 }
 
@@ -2910,7 +2981,7 @@ void ExpEngine::Stop() {
     // below is idempotent, so always run it.
     I->running.exchange(false);
     I->state.store(Impl::kStopped);
-    I->status(L"断开中…");
+    I->status(L"disconnecting...");
     if (I->divert != INVALID_HANDLE_VALUE) {
         I->wd.close(I->divert);
         I->divert = INVALID_HANDLE_VALUE;
@@ -2981,29 +3052,29 @@ void ExpEngine::Stop() {
                          std::to_wstring(k + 1));
         }
         I->dns_backup.changed = false;
-        I->log(L"[exp] 适配器 DNS 已恢复原状" +
-               std::wstring(I->dns_backup.dhcp ? L"（DHCP 自动获取）"
-                                               : L"（原有静态列表）"));
+        I->log(L"[exp] adapter DNS restored" +
+               std::wstring(I->dns_backup.dhcp ? L"(DHCP automatic)"
+                                               : L"(original static list)"));
     }
     if (I->wd.dll) { FreeLibrary(I->wd.dll); I->wd = WD{}; }
-    I->log(L"[exp] ENGINE_STOP 状态=STOPPED；捕获句柄与 DNS 配置已清理"
-           L"（系统路由表未被修改）");
-    I->log(L"[exp] 引擎最终统计: 收包 " +
-           std::to_wstring(I->stats->recv_ok.load()) + L" / 收包错误 " +
-           std::to_wstring(I->stats->recv_err.load()) + L" / 回注成功 " +
-           std::to_wstring(I->stats->inject_ok.load()) + L" / 回注失败 " +
-           std::to_wstring(I->stats->inject_fail.load()) + L" / NAT 碰撞 " +
-           std::to_wstring(I->stats->nat_collision.load()) + L" / 未代理泄漏 " +
-           std::to_wstring(I->stats->leak.load()) + L" / DNS 成功 " +
-           std::to_wstring(I->stats->dns_ok.load()) + L" 失败 " +
-           std::to_wstring(I->stats->dns_fail.load()) + L" / DNS 环回重置 " +
-           std::to_wstring(I->stats->dns_loop_reset.load()) + L" 接收致命错 " +
+    I->log(L"[exp] ENGINE_STOP state=STOPPED; capture handle and DNS config cleaned"
+           L"(system routing table untouched)");
+    I->log(L"[exp] engine final stats: recv " +
+           std::to_wstring(I->stats->recv_ok.load()) + L" / recv-err " +
+           std::to_wstring(I->stats->recv_err.load()) + L" / inject-ok " +
+           std::to_wstring(I->stats->inject_ok.load()) + L" / inject-fail " +
+           std::to_wstring(I->stats->inject_fail.load()) + L" / NAT collision " +
+           std::to_wstring(I->stats->nat_collision.load()) + L" / leak " +
+           std::to_wstring(I->stats->leak.load()) + L" / DNS ok " +
+           std::to_wstring(I->stats->dns_ok.load()) + L" fail " +
+           std::to_wstring(I->stats->dns_fail.load()) + L" / DNS loopback reset " +
+           std::to_wstring(I->stats->dns_loop_reset.load()) + L" recv-fatal " +
            std::to_wstring(I->stats->dns_loop_fatal.load()) +
-           L" / DNS 上游连不上 " +
+           L" / DNS upstream unreachable " +
            std::to_wstring(I->stats->dns_up_connect_fail.load()) +
-           L" 发送失败 " + std::to_wstring(I->stats->dns_up_send_fail.load()) +
-           L" 接收失败 " + std::to_wstring(I->stats->dns_up_recv_fail.load()));
-    I->status(L"未连接");
+           L" send-fail " + std::to_wstring(I->stats->dns_up_send_fail.load()) +
+           L" recv-fail " + std::to_wstring(I->stats->dns_up_recv_fail.load()));
+    I->status(L"not connected");
 }
 
 }  // namespace linkhelm
