@@ -242,6 +242,31 @@ std::string WideToUtf8(const std::wstring& w) {
     return out;
 }
 
+// beta0.3.0: engine runtime LOGS are English-only, but the engine's state
+// callback paints the UI status label. Keep that label bilingual so a Chinese
+// UI does not regress to English just because the log language was fixed.
+static std::wstring LocalizeStatus(const std::wstring& m) {
+    if (!g_lang_zh) return m;
+    struct Pair { const wchar_t* en; const wchar_t* zh; };
+    static const Pair kMap[] = {
+        {L"Loading WinDivert...",                    L"加载 WinDivert…"},
+        {L"Checking phone SOCKS5 auth...",          L"检测手机 SOCKS5 认证…"},
+        {L"Verifying phone egress (G0)...",         L"验证手机出口连通（G0）…"},
+        {L"Opening WinDivert capture...",           L"打开 WinDivert 捕获…"},
+        {L"connected (transparent proxy running, no virtual adapter)",
+                                                    L"已连接（透明代理运行中 · 无虚拟网卡）"},
+        {L"disconnecting...",                       L"断开中…"},
+        {L"not connected",                          L"未连接"},
+        {L"starting",                               L"启动中"},
+        {L"running",                                L"运行中"},
+        {L"stopped",                                L"已停止"},
+    };
+    for (const auto& p : kMap) if (m == p.en) return p.zh;
+    if (m.find(L"FAULTED: ") == 0)
+        return L"故障：" + m.substr(9) + L"（请断开后重连）";
+    return m;
+}
+
 void SetStatus(const std::wstring& text) {
     // LinkHelm-exp: the accel page's status label is gone; engine progress
     // lands on the connect-page status line.
@@ -1252,7 +1277,8 @@ static bool TryConnectOnce(const linkhelm::ExpConfig& cfg,
     g_app.exp = std::make_unique<linkhelm::ExpEngine>(
         [](const std::wstring& m) { Log(m); },
         [](const std::wstring& m) {
-            if (g_app.conn_status) UiText(g_app.conn_status, m.c_str());
+            if (g_app.conn_status)
+                UiText(g_app.conn_status, LocalizeStatus(m).c_str());
             // link loss -> ask the UI thread to start a governed reconnect
             if (!g_app.abort_reconnect.load() && !g_app.quitting.load() &&
                 AutoReconnectEnabled() && g_app.hwnd && IsWindow(g_app.hwnd) &&
