@@ -1,0 +1,28 @@
+# LinkHelm-exp beta0.4.4 - anti-cheat / protected process DIRECT bypass
+#
+# Copy this file to the folder containing LinkHelmExp.exe and rename it to
+# linkhelm_direct_exes.txt. One process image name per line, case-insensitive.
+# Lines beginning with '#' (after optional whitespace) are comments.
+#
+# Matching traffic from these processes is reinjected VERBATIM on Windows'
+# native route and is NEVER sent through the phone SOCKS5 plane. This keeps
+# anti-cheat / DRM handshakes intact and avoids integrity-check false bans.
+# Built-in names (always active even without this file):
+#   Vanguard: vgtray.exe, vanguard.exe
+#   ACE/SGuard: ace-service.exe, ace-tray.exe, sguard64.exe, ...
+#   EAC: easyanticheat.exe, easyanticheat_eos.exe
+#   BattlEye: beservice.exe, beclient.exe
+#   nProtect: npkcrypt.exe, npkcmsvc.exe
+#   TenProtect/TP: tenprotect.exe, tphelper.exe, tpservice.exe
+#
+# IMPORTANT - do NOT add Steam++ / Steam here (beta0.4.5):
+#   This PC's only Internet egress is the phone SOCKS5 relay; the native route
+#   has no Internet. Adding steam++.exe / steam.exe here would force them
+#   DIRECT and leave them offline. Steam++'s own loopback proxy (127.0.0.1)
+#   handles the client->proxy leg and is never captured; its upstream MUST stay
+#   captured by WinDivert and relayed over the phone SOCKS5 plane. The beta0.4.4
+#   Steam++ direct entries were reverted for exactly this reason.
+#
+# Add your game's own anti-cheat helper here if it is not listed above, e.g.:
+# mygame-anticheat.exe
+# some-launcher-ac.exe

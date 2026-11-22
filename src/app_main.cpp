@@ -1277,6 +1277,14 @@ static bool TryConnectOnce(const linkhelm::ExpConfig& cfg,
     g_app.exp = std::make_unique<linkhelm::ExpEngine>(
         [](const std::wstring& m) { Log(m); },
         [](const std::wstring& m) {
+            // v0.5.0: phone-liveness watchdog detected the phone is gone.
+            // Engine already tore itself down; reset the UI to "not connected"
+            // WITHOUT auto-reconnect (user reconnects manually when phone back).
+            if (m == L"PHONE_LOST_AUTO_DISCONNECT") {
+                if (g_app.hwnd && IsWindow(g_app.hwnd))
+                    PostMessageW(g_app.hwnd, WM_APP + 16, 0, 0);
+                return;
+            }
             if (g_app.conn_status)
                 UiText(g_app.conn_status, LocalizeStatus(m).c_str());
             // link loss -> ask the UI thread to start a governed reconnect
@@ -1713,14 +1721,17 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                                          L"/TR \"" + std::wstring(self) +
                                          L"\" /SC ONLOGON /F";
                         // fall back to RunOnce (no admin needed)
-                        std::wstring reg = L"reg add HKCU\Software\Microsoft"
-                                           L"\Windows\CurrentVersion\Run "
+                        // beta0.4.1 bugfix: doubled backslashes. The old
+                        // single '\S'/'\M' were unknown C++ escapes and GCC
+                        // dropped the backslash, corrupting the registry path.
+                        std::wstring reg = L"reg add HKCU\\Software\\Microsoft"
+                                           L"\\Windows\\CurrentVersion\\Run "
                                            L"/v LinkHelm /t REG_SZ /d \"" +
                                            std::wstring(self) + L"\" /f";
                         RunPowerShell(reg);
                     } else {
-                        RunPowerShell(L"reg delete HKCU\Software\Microsoft"
-                                      L"\Windows\CurrentVersion\Run "
+                        RunPowerShell(L"reg delete HKCU\\Software\\Microsoft"
+                                      L"\\Windows\\CurrentVersion\\Run "
                                       L"/v LinkHelm /f");
                     }
                     return 0;
@@ -2048,11 +2059,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     MessageBoxW(hwnd,
                         g_lang_zh
                             ? L"【产品说明】\n"
-                              L"LinkHelm-exp beta0.4.0（实验版）。无虚拟网卡透明上网："
+                              L"LinkHelm-exp v0.5.0（实验版）。无虚拟网卡透明上网："
                               L"WinDivert 拦截本机流量，经 Wi-Fi Direct 直连手机上的 "
                               L"SOCKS5 出口（TCP CONNECT + UDP ASSOCIATE，RFC 1929 "
                               L"用户名/密码认证）。不含商店加速；连接、共享(ICS)、"
                               L"文件传输功能与主线一致。\n\n"
+                              L"【v0.5.0 更新】\n"
+                              L"· 修复游戏断网：上版(Beta0.4.8)默认让 LOL 本体走 B 路（WinDivert 原样"
+                              L"注入原生路由），而这台机器原生路由没有网，导致游戏掉线。本版默认改回 "
+                              L"A++（RelayMode=0）：所有程序——含 LOL 本体与 ACE / Guard / Vanguard / "
+                              L"EAC / BattlEye / TenProtect——一律走 WinDivert 本地反射→手机 SOCKS5，"
+                              L"所有进程同一条路径、无差别对待（反作弊指纹最低）。DNS 同样走此路。\n"
+                              L"· 回退合并握手、修复 app-closed 过多：上版合并 SOCKS5 握手在真机上"
+                              L"报 CONNECT_REPLY_MISSING，失败连接关闭时全被计入 app-closed，导致该计数"
+                              L"快速上涨；而真机实测合并握手仅省约 1ms。本版默认改回串行握手，连接更稳。"
+                              L"（如需可在 exp_policy.ini 设 FastHandshake=1 重新开启。）\n"
+                              L"· 手机掉线自动断连：新增手机存活看门狗，每 10s 探测一次『手机→公网 DNS』"
+                              L"完整链路（即使当前没有活跃连接也会探测）；连续 3 次失败（约 30s，"
+                              L"避免走路/信号抖动误判）即判定手机已离线（App 关闭/超出范围/无信号），"
+                              L"自动断开并把状态复位为『未连接』，不再自动重连——手机恢复后请手动点连接。"
+                              L"可用 exp_policy.ini 的 PhoneLiveness=0 关闭该看门狗。\n"
+                              L"· 说明：本机「真直连」与「中转」的公网出口是同一张手机卡，出口 IP 不变；"
+                              L"持续传输的 RTT 由手机蜂窝链路物理决定，软件无法消除。RelayMode=1/2 "
+                              L"保留为有原生网络机器的可选项。\n"
+                              L"· Steam++ / Steam 已从上版直连名单移除：其 127.0.0.1 本地代理段"
+                              L"由 Steam++ 自己处理，上游流量回到 WinDivert→手机 SOCKS5 链路。"
+                              L"请在 Steam++ 中点『启动加速』并保持连接。\n"
+                              L"· 应用级 DNS 恢复正常连接池：多条查询复用少量到手机的"
+                              L"长连接（含失效重拨与内存缓存），解决时快时慢与 DNS/TCP 大量超时。\n"
+                              L"· DNS 全在应用层拦截解析，不修改系统 DNS / 网卡设置，"
+                              L"退出无需还原、不会污染系统解析。\n\n"
                               L"【开源组件】\n"
                               L"· WinDivert — 数据包捕获/注入，LGPL-2.1/GPL-2.0 双许可，"
                               L"reqrypt.org/windivert（WinDivert.dll/.sys 随包分发，"
@@ -2069,13 +2105,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               L"仅供个人学习与合法用途。使用者应遵守所在地法律法规，"
                               L"不得用于任何违法用途。软件按『现状』提供，不附带任何担保。"
                             : L"[Product]\n"
-                              L"LinkHelm-exp beta0.4.0 (experimental). Transparent "
+                              L"LinkHelm-exp v0.5.0 (experimental). Transparent "
                               L"networking WITHOUT a virtual adapter: WinDivert "
                               L"captures host traffic and forwards it to the "
                               L"SOCKS5 host on your phone over Wi-Fi Direct "
                               L"(TCP CONNECT + UDP ASSOCIATE, RFC 1929 auth). "
                               L"Store boost removed; connect, sharing (ICS) and "
                               L"file transfer unchanged.\n\n"
+                              L"[v0.5.0 updates]\n"
+                              L"\u00b7 Game-offline FIX: the previous build defaulted the LOL "
+                              L"client to route B (WinDivert verbatim reinjection onto the native "
+                              L"route), but this machine's native route has NO Internet, so the "
+                              L"game dropped offline. The default is now A++ (RelayMode=0): EVERY "
+                              L"process - LOL client and ACE / Guard / Vanguard / EAC / BattlEye / "
+                              L"TenProtect alike - uses the WinDivert local-reflection -> phone "
+                              L"SOCKS5 route. All processes take the identical path (lowest "
+                              L"anti-cheat fingerprint). DNS uses it too.\n"
+                              L"\u00b7 Pipelined handshake REVERTED (fixes 'app-closed too many'): "
+                              L"the previous build's coalesced SOCKS5 handshake produced "
+                              L"CONNECT_REPLY_MISSING on the real phone; each failed connect was "
+                              L"counted as an app-closed flow, inflating that counter. Real-phone "
+                              L"A/B measured only ~1ms gain, so the default is back to the serial "
+                              L"handshake. Opt back in with FastHandshake=1 in exp_policy.ini.\n"
+                              L"\u00b7 Phone-loss auto-disconnect: a new watchdog probes the full "
+                              L"phone -> public-DNS path every 10s (even with 0 active TCP flows). "
+                              L"After 3 consecutive failures (~30s, tolerating brief signal wobbles) "
+                              L"it declares the phone unreachable (app closed / out of range / no "
+                              L"signal), auto-disconnects and resets the UI to 'not connected' with "
+                              L"NO auto-reconnect - reconnect manually when the phone is back. "
+                              L"Set PhoneLiveness=0 in exp_policy.ini to disable the watchdog.\n"
+                              L"\u00b7 Note: on this host 'true direct' and 'relay' share the SAME "
+                              L"phone-cellular egress IP, so the source IP never changes; steady-state "
+                              L"RTT is set by the phone's cellular link and cannot be removed by "
+                              L"software. RelayMode=1/2 remain as opt-ins for machines with a real "
+                              L"native route.\n"
+                              L"\u00b7 Steam++ direct-bypass was REVERTED in the previous "
+                              L"build: its 127.0.0.1 loopback leg stays with Steam++ while "
+                              L"the upstream is captured by WinDivert and carried over the "
+                              L"phone SOCKS5 plane. Press START ACCELERATION in Steam++ and "
+                              L"keep connected.\n"
+                              L"\u00b7 Application-level DNS keeps a healthy connection "
+                              L"pool to the phone (reuse + redial + in-app cache) instead "
+                              L"of a fresh link per query - fixes the connection flood "
+                              L"that overwhelmed the phone and caused DNS/TCP timeouts.\n"
+                              L"\u00b7 DNS is resolved entirely at the application "
+                              L"layer - no system/adapter DNS is changed, nothing to "
+                              L"restore on exit, no resolver pollution.\n\n"
                               L"[Open source]\n"
                               L"\u00b7 WinDivert - packet capture/injection, "
                               L"LGPL-2.1/GPL-2.0 dual license, reqrypt.org "
@@ -2205,6 +2280,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP + 15:  // beta1.1.2: background teardown finished -> exit
             DestroyWindow(hwnd);
             return 0;
+        case WM_APP + 16: {  // v0.5.0: phone lost -> auto-disconnect, NO reconnect
+            // Engine already faulted + stopped capture itself. Tear down the
+            // remaining state on a worker, then reset the connect UI. Do NOT
+            // set abort_reconnect here (that is for user Disconnect) and do
+            // NOT post WM_APP+14: the user reconnects manually when ready.
+            g_app.abort_reconnect.store(true);
+            std::thread([] {
+                StopEngineSafe();
+                Log(L"[exp] auto-disconnected: phone unreachable "
+                    L"(app closed / out of range / no signal)");
+                g_app.connect_fail_streak.store(0);
+                UiEnable(g_app.conn_btn, TRUE);
+                UiEnable(g_app.disc_btn, FALSE);
+                UiText(g_app.conn_status,
+                       TR(L"Status: disconnected - phone unreachable "
+                          L"(reconnect when phone is back)",
+                          L"状态：已断开 - 手机不可达（手机恢复后请手动重连）"));
+                g_app.conn_busy.store(false);
+            }).detach();
+            return 0;
+        }
         case WM_CLOSE:
             // Tray residency: X minimizes, it never exits. Only the tray's
             // "quit & clean up network" ends the process.
@@ -2413,8 +2509,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int cmd_show) {
     RegisterClassW(&swc);
 
     HWND hwnd = CreateWindowExW(0, kClass,
-        TR(L"LinkHelm-exp beta0.4.0 (WinDivert, no virtual adapter)",
-           L"LinkHelm-exp beta0.4.0（WinDivert 无虚拟网卡实验版）"),
+        TR(L"LinkHelm-exp v0.5.0 (WinDivert, no virtual adapter)",
+           L"LinkHelm-exp v0.5.0（WinDivert 无虚拟网卡实验版）"),
                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                                     WS_MINIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, kWidth, kHeight,

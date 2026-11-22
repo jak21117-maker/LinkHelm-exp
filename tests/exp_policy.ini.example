@@ -36,3 +36,49 @@ FlowLog=0
 ; Aggregate stats row cadence in seconds (5..300, default 30).
 ; Higher values reduce log volume further without losing counters.
 StatsIntervalSec=30
+
+; beta0.4.1 DNS mode:
+;   0 (default) = application-level only. WinDivert captures UDP:53 and
+;                 relays it over SOCKS5 TCP DNS; NO system/adapter DNS is
+;                 changed and nothing needs restoring on exit.
+;   1 (legacy)  = in-process 127.0.0.1:53 stub + netsh set dns on the phone
+;                 adapter (beta0.4.0 behaviour; pollutes system DNS).
+SystemDnsProxy=0
+
+; beta0.4.9 routing (relay_mode). The native/B route has NO Internet on the
+; phone's Wi-Fi Direct link (P2P group does not NAT forwarded packets), so
+; sending any process down it drops that process offline. The default is now
+; all-relay so the game (LOL) stays online:
+;   0 (default) = A++ : EVERY process - game client, browser AND the ACE/Guard/
+;                 Vanguard/EAC/BattlEye/TenProtect denylist - goes through the
+;                 WinDivert local-reflection -> phone SOCKS5 route. All processes
+;                 take the IDENTICAL path (lowest anti-cheat fingerprint). DNS
+;                 is always on this route.
+;   1           = beta0.4.8 opt-in: denylist -> SOCKS5 relay, all others ->
+;                 native direct (NO Internet here - game will go offline).
+;   2           = legacy opt-in: denylist -> native direct, others -> SOCKS5.
+; Only set 1/2 on a machine with a real native default route.
+; RelayMode=0
+;
+; beta0.4.9 "A++" fast handshake (FastHandshake) — beta0.5.0 default OFF:
+;   0 (default) = serial 3-RTT handshake. The pipelined mode caused
+;                 CONNECT_REPLY_MISSING on the real phone (each failed connect
+;                 counted as an app-closed flow), while real-phone A/B measured
+;                 only ~1ms gain. Keep it OFF unless a specific peer is known
+;                 to handle coalesced greeting+auth+CONNECT correctly.
+;   1           = opt-in pipelined 1-RTT handshake (see exp_socks5.cpp).
+FastHandshake=0
+;
+; beta0.5.0 phone-liveness watchdog (auto-disconnect when the phone is gone):
+;   The PC has no other Internet egress, so when the phone app is closed, the
+;   phone is out of range, or its cellular uplink drops, the tunnel becomes a
+;   silent black hole while the UI still says "connected". A dedicated thread
+;   probes the full phone -> public-DNS path every ProbeIntervalSec seconds
+;   even when there are 0 active TCP flows. After ProbeStrikes consecutive
+;   failures the engine auto-disconnects (UI resets to "not connected", NO
+;   auto-reconnect); reconnect manually when the phone is back. One success
+;   resets the strike counter.
+; PhoneLiveness=0 disables the watchdog entirely (restore old behaviour).
+PhoneLiveness=1
+ProbeIntervalSec=10
+ProbeStrikes=3

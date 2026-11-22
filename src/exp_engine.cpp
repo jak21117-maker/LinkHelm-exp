@@ -26,12 +26,16 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 #include "windivert.h"
 
 // SIO_KEEPALIVE_VALS is declared in mstcpip.h, which is not present in every
@@ -152,6 +156,184 @@ bool IsBypassDst(uint32_t dst_net) {
     if (o1 >= 224) return true;                                    // multicast + reserved
     return false;
 }
+
+// ------------------------- beta0.4.1: anti-cheat direct bypass -------------
+// Protected/anti-cheat services must NEVER be routed through the phone
+// SOCKS5 plane: doing so trips integrity checks, hardware/account bans and
+// can break the anti-cheat handshake entirely. Their packets are reinjected
+// verbatim (Windows' native route) instead of being proxied. This is the
+// same "should_proxy=false -> WinDivertSend verbatim" pattern used by the
+// vendored wfp-divert reference (src/divert.cpp:707-733), adapted here with a
+// PID-name cache so the OS connection table is not walked on every packet.
+namespace anticheat {
+
+std::wstring LowerW(std::wstring s) {
+    for (wchar_t& c : s) c = static_cast<wchar_t>(std::towlower(c));
+    return s;
+}
+
+// Built-in denylist (process image names). Kept deliberately to the services
+// that actually enforce anti-cheat / DRM, NOT to game executables themselves.
+// Extra names can be added via linkhelm_direct_exes.txt (one name per line).
+const wchar_t* kBuiltinNames[] = {
+    // Riot Vanguard
+    L"vanguard.exe", L"vgtray.exe", L"vgk.exe",
+    // Tencent ACE (Anti-Cheat Expert) / SGuard
+    L"ace-service.exe", L"ace-tray.exe", L"acesv.exe", L"aceclient.exe",
+    L"sguard64.exe", L"sguard32.exe", L"ace-base64.exe",
+    // Easy Anti-Cheat
+    L"easyanticheat.exe", L"easyanticheat_eos.exe", L"eaclauncher.exe",
+    // BattlEye
+    L"beservice.exe", L"beclient.exe", L"belauncher.exe",
+    // nProtect GameGuard
+    L"npkcrypt.exe", L"npkcmsvc.exe", L"npclient.exe", L"npgg.exe",
+    // Tencent TenProtect / TP
+    L"tenprotect.exe", L"tphelper.exe", L"tpservice.exe", L"qqprotect.exe",
+    // beta0.4.5: Steam++ / Steam are NOT on the direct-bypass list. This PC's
+    // only egress is the phone SOCKS5 relay (the native route has no Internet),
+    // so forcing these processes DIRECT leaves them offline. Steam++'s loopback
+    // proxy (127.0.0.1:<port>) is handled by Steam++ itself; its upstream MUST
+    // be captured by WinDivert and carried over the phone SOCKS5 plane. The
+    // beta0.4.4 Steam++ direct entries were reverted for this reason.
+};
+
+struct NameCache {
+    std::mutex mtx;
+    std::unordered_map<DWORD, std::wstring> by_pid;   // "" = not found
+    std::unordered_set<std::wstring> direct_names;
+};
+
+NameCache& Cache() {
+    static NameCache c;
+    return c;
+}
+
+// Load extra process names once from linkhelm_direct_exes.txt next to the exe.
+void LoadDirectExeFile() {
+    NameCache& c = Cache();
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    std::wstring dir(self);
+    size_t sl = dir.rfind(L'\\');
+    if (sl != std::wstring::npos) dir = dir.substr(0, sl);
+    FILE* f = _wfopen((dir + L"\\linkhelm_direct_exes.txt").c_str(), L"r,ccs=UTF-8");
+    if (!f) return;
+    wchar_t line[512];
+    while (fgetws(line, 512, f)) {
+        std::wstring n(line);
+        while (!n.empty() && (n.back() == L'\r' || n.back() == L'\n' ||
+                              n.back() == L' ' || n.back() == L'\t')) n.pop_back();
+        size_t p = n.find_first_not_of(L" \t");
+        if (p == std::wstring::npos || n[p] == L'#') continue;
+        if (p) n = n.substr(p);
+        if (!n.empty()) c.direct_names.insert(LowerW(n));
+    }
+    fclose(f);
+}
+
+void InitNames() {
+    NameCache& c = Cache();
+    {
+        std::lock_guard<std::mutex> lk(c.mtx);
+        if (!c.direct_names.empty()) return;   // already initialised
+        for (const wchar_t* n : kBuiltinNames) c.direct_names.insert(LowerW(n));
+    }
+    LoadDirectExeFile();
+}
+
+std::wstring ProcessName(DWORD pid) {
+    NameCache& c = Cache();
+    {
+        std::lock_guard<std::mutex> lk(c.mtx);
+        auto it = c.by_pid.find(pid);
+        if (it != c.by_pid.end()) return it->second;
+    }
+    std::wstring name;
+    // Fast path: Toolhelp snapshot gives the image name without opening the
+    // process (works even for protected PIDs we cannot OpenProcess).
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ProcessID == pid) { name = LowerW(pe.szExeFile); break; }
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    if (name.empty()) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (h) {
+            wchar_t buf[MAX_PATH]{};
+            DWORD n = MAX_PATH;
+            if (QueryFullProcessImageNameW(h, 0, buf, &n) && n > 0) {
+                std::wstring full(buf);
+                size_t slash = full.find_last_of(L"\\/");
+                name = LowerW(slash == std::wstring::npos ? full
+                                                          : full.substr(slash + 1));
+            }
+            CloseHandle(h);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(c.mtx);
+        c.by_pid[pid] = name;   // "" cached too (avoids repeated work for gone PIDs)
+    }
+    return name;
+}
+
+bool IsDirectProcess(DWORD pid) {
+    if (pid == 0) return false;
+    std::wstring name = LowerW(ProcessName(pid));  // defensive: normalise here
+    if (name.empty()) return false;
+    NameCache& c = Cache();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    return c.direct_names.find(name) != c.direct_names.end();
+}
+
+// Reverse-map a captured outbound flow to its owning PID using the OS table.
+// Ports arrive in network order from WinDivert and from the IP helper API.
+uint32_t PidByUdp(uint32_t src_ip_net, uint16_t src_port_net) {
+    ULONG sz = 0;
+    if (GetExtendedUdpTable(nullptr, &sz, FALSE, AF_INET,
+                            UDP_TABLE_OWNER_PID, 0) != ERROR_INSUFFICIENT_BUFFER ||
+        sz == 0) return 0;
+    std::vector<uint8_t> buf(sz);
+    auto* t = reinterpret_cast<MIB_UDPTABLE_OWNER_PID*>(buf.data());
+    if (GetExtendedUdpTable(t, &sz, FALSE, AF_INET,
+                            UDP_TABLE_OWNER_PID, 0) != NO_ERROR) return 0;
+    for (DWORD i = 0; i < t->dwNumEntries; ++i) {
+        const auto& r = t->table[i];
+        if ((r.dwLocalAddr == src_ip_net || r.dwLocalAddr == 0) &&
+            static_cast<uint16_t>(r.dwLocalPort) == src_port_net)
+            return r.dwOwningPid;
+    }
+    return 0;
+}
+
+uint32_t PidByTcp(uint32_t src_ip_net, uint16_t src_port_net,
+                  uint32_t dst_ip_net, uint16_t dst_port_net) {
+    ULONG sz = 0;
+    if (GetExtendedTcpTable(nullptr, &sz, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) != ERROR_INSUFFICIENT_BUFFER ||
+        sz == 0) return 0;
+    std::vector<uint8_t> buf(sz);
+    auto* t = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buf.data());
+    if (GetExtendedTcpTable(t, &sz, FALSE, AF_INET,
+                            TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) return 0;
+    for (DWORD i = 0; i < t->dwNumEntries; ++i) {
+        const auto& r = t->table[i];
+        if ((r.dwLocalAddr == src_ip_net || r.dwLocalAddr == 0) &&
+            static_cast<uint16_t>(r.dwLocalPort) == src_port_net &&
+            r.dwRemoteAddr == dst_ip_net &&
+            static_cast<uint16_t>(r.dwRemotePort) == dst_port_net)
+            return r.dwOwningPid;
+    }
+    return 0;
+}
+
+}  // namespace anticheat
 
 std::wstring IpW(uint32_t net) {
     in_addr a;
@@ -541,6 +723,10 @@ struct EngineStats {
     // ProxyBridge is_proxy_server_endpoint / is_proxy_udp_endpoint: the
     // relay's OWN traffic must never re-enter the redirector.
     std::atomic<uint64_t> endpoint_bypass{0};
+    // beta0.4.1: packets deliberately passed straight through (native route)
+    // because their owning process is on the anti-cheat direct denylist.
+    std::atomic<uint64_t> anticheat_direct_packets{0};
+    std::atomic<uint64_t> anticheat_direct_flows{0};
     // UDP reply injection is the half of the loop the field log never
     // proved. Split it out of the global inject counters.
     std::atomic<uint64_t> udp_inject_ok{0};
@@ -636,14 +822,64 @@ struct ExpPolicy {
     // rows for healthy flows. Diagnostics are an OPT-IN switch, not the
     // default; abnormal flows are still always logged.
     bool flow_log = false;          // true = verbose per-flow lifecycle
-    int  stats_interval_s = 30;     // aggregate line cadence (seconds)
+    int  stats_interval_s = 60;     // aggregate line cadence (seconds); beta0.4.2: 30->60 to cut log spam
+    // beta0.4.1: DNS is resolved ENTIRELY at the application layer — WinDivert
+    // captures UDP:53 and relays it over SOCKS5 TCP DNS (RFC 7766) to a public
+    // resolver, then synthesises the reply. NO netsh change to any adapter's
+    // DNS is performed (default), so system DNS is never polluted/touched.
+    // Set to 1 to restore the OLD beta0.4.0 behaviour (127.0.0.1 loopback
+    // proxy + netsh set dns).
+    bool system_dns_proxy = false;
+    // beta0.4.9: routing mode. The native/B route has NO Internet on this host
+    // (Wi-Fi Direct P2P group does not NAT forwarded packets; proven by ICMP
+    // tracert: 192.168.49.1 -> "destination host unreachable"). Sending ANY
+    // process down the B route drops it offline, which is why beta0.4.8's
+    // default mode 1 killed the game. The denylist is kept intact for config
+    // compatibility, but the DEFAULT is now all-relay.
+    //   0 (default) all-relay / "A++": every process, including ACE/Guard,
+    //        goes via the WinDivert local-reflection -> phone SOCKS5 route.
+    //        Combined with fast_handshake this is the shortest, lowest-fingerprint
+    //        A route (see below). DNS is always on this route.
+    //   1 anticheat-relay-only (beta0.4.8, BROKEN here): listed -> A, others
+    //        -> B(native). Only usable when the native route has Internet.
+    //   2 legacy-direct (beta0.4.1-0.4.6): listed -> B(native), others -> A.
+    int  relay_mode = 0;
+    // beta0.4.9 "A++": pipelined SOCKS5 greeting+auth+CONNECT into a single
+    // send. beta0.5.0 REVERTED to OFF: field logs showed CONNECT_REPLY_MISSING
+    // (pipelined) on the real phone, and every failed connect is counted as an
+    // app-closed flow (the "app-closed too many" symptom). Real-phone A/B
+    // measured only ~1ms gain because the phone sits on the near Wi-Fi-Direct
+    // hop, so the pipelined handshake was pure risk with no benefit. 1 can be
+    // re-enabled on a peer that handles coalesced requests correctly.
+    bool fast_handshake = false;
+    // beta0.5.0: phone-liveness watchdog. When the phone app is closed, the
+    // phone is out of range, or its cellular uplink drops, the PC has NO other
+    // egress — so the tunnel becomes a black hole while the UI still says
+    // "connected" (the "app-closed too many" log flood). A lightweight SOCKS5
+    // CONNECT probe runs every probe_interval_s regardless of active TCP flows
+    // (so it also works when tcp=0); after probe_strikes consecutive failures
+    // the engine FAULTs and the UI tears the connection down (NO auto-reconnect
+    // by default — the user reconnects manually once the phone is back).
+    bool phone_liveness = true;     // master switch
+    int  probe_interval_s = 10;     // 10s x 3 strikes = 30s to declare loss
+    int  probe_strikes = 3;
+    // Legacy field kept for config compat; superseded by relay_mode.
+    bool anticheat_direct = false;
 };
 
 // Single global read-only switch, published once from Start(). Every log
 // site consults it: no policy object has to be threaded through detached
 // workers (they must never touch Impl after Stop).
 static std::atomic<bool> g_flow_log{false};
-static std::atomic<int>  g_stats_interval_s{30};
+static std::atomic<int>  g_stats_interval_s{60};
+// beta0.4.9 A++ pipelined handshake — beta0.5.0 default OFF (see policy above).
+// Published once from Start(); detached TcpWorkers read it so they never
+// touch Impl after Stop. DNS upstream CONNECTs always use the serial handshake.
+static std::atomic<bool> g_fast_handshake{false};
+// beta0.4.1: the app-level DNS interception branch (DnsWorker) needs the same
+// AAAA-suppression switch the loopback proxy had. Detached workers cannot
+// read Impl, so publish it once from Start().
+static std::atomic<bool> g_aaaa_suppress{true};
 
 // beta0.3.1: one anomalous line per 30 s at most. The periodic stats row
 // already carries the complete counters, so a coarse global throttle only
@@ -691,6 +927,34 @@ ExpPolicy LoadPolicy() {
     int c = GetPrivateProfileIntW(sec, L"ConnectConcurrency", 0,
                                   path.c_str());
     if (c >= 1 && c <= 64) p.concurrency = c;
+    // beta0.4.1: default 0 = never touch system DNS. Opt-in 1 restores the
+    // legacy loopback-proxy + netsh behaviour for compatibility testing.
+    read(L"SystemDnsProxy", L"0");
+    p.system_dns_proxy = (_wcsicmp(buf, L"1") == 0);
+    // beta0.4.7: anti-cheat direct bypass is OFF by default. On this host the
+    // only egress is the phone SOCKS5 relay; the native route has NO Internet,
+    // so DIRECT-bypassing ACE/Vanguard/EAC/BE/nProtect/TenProtect leaves them
+    // offline. With the switch off these processes fall back to the existing
+    // WinDivert -> SOCKS5 transparent relay (reachable, slightly higher RTT =
+    // "weak network" but online). Set 1 only on a machine with a real native
+    // route. The denylist and name recognition are kept intact.
+    read(L"RelayMode", L"0");
+    int rm = _wtoi(buf);
+    if (rm >= 0 && rm <= 2) p.relay_mode = rm;
+    // beta0.4.9 A++ short-reflection handshake — beta0.5.0 default OFF
+    // (CONNECT_REPLY_MISSING on the real phone; ~1ms gain only). Opt-in via 1.
+    read(L"FastHandshake", L"0");
+    p.fast_handshake = (_wcsicmp(buf, L"1") == 0);
+    // beta0.5.0 phone-liveness watchdog (default ON, 10s x 3 = 30s to fault).
+    read(L"PhoneLiveness", L"1");
+    p.phone_liveness = (_wcsicmp(buf, L"0") != 0);
+    int pi = GetPrivateProfileIntW(sec, L"ProbeIntervalSec", 10, path.c_str());
+    if (pi >= 2 && pi <= 60) p.probe_interval_s = pi;
+    int ps = GetPrivateProfileIntW(sec, L"ProbeStrikes", 3, path.c_str());
+    if (ps >= 2 && ps <= 10) p.probe_strikes = ps;
+    // Legacy alias: AntiCheatDirect=1 maps to mode 2, otherwise keep mode 0.
+    read(L"AntiCheatDirect", L"0");
+    p.anticheat_direct = (_wcsicmp(buf, L"1") == 0);
     return p;
 }
 
@@ -934,6 +1198,33 @@ struct DnsProxy {
     std::atomic<int64_t> last_upstream_log_ms{0};
 };
 
+// beta0.4.2: cache shared by the DEFAULT application-level DNS path (DnsWorker,
+// detached threads). DnsProxy above has its own cache but that loopback path is
+// disabled by default, so repeated lookups used to flood the phone with fresh
+// SOCKS5 connections. This keeps hot names answered locally, inside the app.
+static DnsCache g_app_dns_cache;
+
+// beta0.4.3: the application-level DNS path used to open a FRESH SOCKS5 TCP
+// connection to the phone for every single query and close it afterwards
+// (beta0.4.1 dropped the loopback proxy's mature pool when it switched paths).
+// With ~1000 queries that flooded the phone's 8080 accept queue: TCP DNS
+// queries AND data-plane CONNECTs started timing out even to 192.168.49.1
+// itself. Mirror DnsProxy's proven pool: keep a handful of healthy links to
+// the upstream resolver and reuse them; retire a link that the peer closed
+// while idle and redial once. DnsWorker runs detached, so the pool is global.
+struct AppDnsPool {
+    std::mutex mtx;
+    std::vector<SOCKET> links;
+    size_t cap = 8;       // same as the loopback DnsProxy pool_cap
+};
+static AppDnsPool g_app_dns_pool;
+
+static void AppDnsPoolDrain() {
+    std::lock_guard<std::mutex> lk(g_app_dns_pool.mtx);
+    for (SOCKET s : g_app_dns_pool.links) closesocket(s);
+    g_app_dns_pool.links.clear();
+}
+
 void DnsQueryWorker(DnsProxy* p, std::vector<uint8_t> query, sockaddr_in client,
                     const std::string& phone8, uint16_t phone_port,
                     const ExpAuth& auth, std::shared_ptr<EngineStats> stats,
@@ -1172,53 +1463,97 @@ void DnsWorker(HANDLE divert, WD wd, std::string phone8, uint16_t phone_port,
     dns_budget->fetch_add(1);
     int qlen = static_cast<int>(query.size());
     bool ok = false;
+    std::vector<uint8_t> reply;
     do {
         if (qlen <= 0 || qlen > 4096) break;  // absurd query — drop
-        std::string err;
-        SOCKET s = ExpSocks5TcpConnect(phone8, phone_port, auth, upstream_ip_net,
-                                       dns_port_net, &err);
-        if (s == INVALID_SOCKET) break;
+        // beta0.4.2: serve repeated lookups from the app-internal cache. The
+        // loopback DnsProxy caches, but the DEFAULT app-level path did not:
+        // every duplicate query opened a NEW SOCKS5 TCP link to the phone,
+        // which under load caused a connection flood -> 15s CONNECT timeouts
+        // -> more retries -> cascade stall. A fresh hit is injected locally.
+        bool cached = false;
+        {
+            bool stale = false;
+            std::vector<uint8_t> creply;
+            if (DnsCacheLookup(&g_app_dns_cache, query, &creply, &stale) &&
+                !stale) {
+                reply = std::move(creply);
+                cached = true;
+                stats->dns_cache_hit.fetch_add(1);
+            }
+        }
+        if (!cached) {
         // TCP DNS: 2-byte length prefix, then the message
         std::vector<uint8_t> req(2 + query.size());
         req[0] = static_cast<uint8_t>(qlen >> 8);
         req[1] = static_cast<uint8_t>(qlen);
         std::memcpy(req.data() + 2, query.data(), query.size());
-        DWORD tmo = 5000;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char*>(&tmo), sizeof(tmo));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
-                   reinterpret_cast<const char*>(&tmo), sizeof(tmo));
-        bool sent = true;
-        {
-            int off = 0;
-            while (off < (int)req.size()) {
-                int n = send(s, reinterpret_cast<const char*>(req.data() + off),
-                             (int)req.size() - off, 0);
-                if (n <= 0) { sent = false; break; }
-                off += n;
+        // beta0.4.3: reuse a pooled link; a link the phone closed while idle
+        // fails its first use, so retire it and redial ONCE (same pattern as
+        // the loopback DnsQueryWorker that beta0.4.1 accidentally dropped).
+        for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+            SOCKET s = INVALID_SOCKET;
+            bool from_pool = false;
+            if (attempt == 0) {
+                std::lock_guard<std::mutex> lk(g_app_dns_pool.mtx);
+                if (!g_app_dns_pool.links.empty()) {
+                    s = g_app_dns_pool.links.back();
+                    g_app_dns_pool.links.pop_back();
+                    from_pool = true;
+                }
             }
+            if (s == INVALID_SOCKET) {
+                std::string err;
+                s = ExpSocks5TcpConnect(phone8, phone_port, auth,
+                                        upstream_ip_net, dns_port_net, &err);
+                if (s == INVALID_SOCKET) {
+                    stats->dns_up_connect_fail.fetch_add(1);
+                    continue;
+                }
+                if (attempt > 0) stats->dns_pool_redial_ok.fetch_add(1);
+            }
+            DWORD tmo = 5000;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+                       reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+            bool good = SendAllRaw(s, req.data(), (int)req.size());
+            uint8_t lenb[2];
+            int rlen = 0;
+            std::vector<uint8_t> rbuf;
+            if (good) good = RecvAllRaw(s, lenb, 2);
+            if (good) {
+                rlen = (lenb[0] << 8) | lenb[1];
+                if (rlen <= 0 || rlen > 65535) good = false;
+            }
+            if (good) {
+                rbuf.resize((size_t)rlen);
+                good = RecvAllRaw(s, rbuf.data(), rlen);
+            }
+            if (!good) {
+                if (from_pool) stats->dns_pool_reuse_fail.fetch_add(1);
+                stats->dns_up_recv_fail.fetch_add(1);
+                closesocket(s);
+                continue;  // fresh dial on the next attempt
+            }
+            // healthy link: hand it back to the pool for reuse
+            {
+                std::lock_guard<std::mutex> lk(g_app_dns_pool.mtx);
+                if (g_app_dns_pool.links.size() < g_app_dns_pool.cap)
+                    g_app_dns_pool.links.push_back(s);
+                else
+                    closesocket(s);
+            }
+            reply = std::move(rbuf);
+            ok = true;   // reply ready; the enclosing do{} injects it below
         }
-        if (!sent) { closesocket(s); break; }
-        uint8_t lenb[2];
-        int got = 0;
-        while (got < 2) {
-            int n = recv(s, reinterpret_cast<char*>(lenb + got), 2 - got, 0);
-            if (n <= 0) break;
-            got += n;
-        }
-        if (got < 2) { closesocket(s); break; }
-        int rlen = (lenb[0] << 8) | lenb[1];
-        if (rlen <= 0 || rlen > 65535) { closesocket(s); break; }
-        std::vector<uint8_t> reply((size_t)rlen);
-        got = 0;
-        while (got < rlen) {
-            int n = recv(s, reinterpret_cast<char*>(reply.data() + got),
-                         rlen - got, 0);
-            if (n <= 0) break;
-            got += n;
-        }
-        closesocket(s);
-        if (got < rlen) break;
+        if (ok) DnsCacheStore(&g_app_dns_cache, query, reply);
+        }  // if (!cached)
+        // beta0.4.3: both a cache hit and a successful pooled exchange leave
+        // a non-empty reply. If every dial/retry failed, do NOT inject an
+        // empty datagram - drop the query and let the app's own resolver
+        // retry (it will re-send the UDP query on its normal timer).
+        if (reply.empty()) break;
         // rebuild the UDP datagram: it looks like it came from the DNS
         // server straight to the app's socket
         size_t psz = sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) +
@@ -1328,10 +1663,18 @@ void TcpWorker(std::shared_ptr<TcpSession> s, NatEntry entry,
     if (stop->load()) {
         err.clear();
         tm = ExpSocks5Timing{};
-        r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
-                                htonl(entry.orig_dst_ip),
-                                htons(entry.orig_dst_port), &err, &tm,
-                                &local_ip);
+        if (g_fast_handshake.load()) {
+            // beta0.4.9 A++: one-packet handshake, ~2 RTT shorter reflection arc.
+            r = ExpSocks5TcpConnectFast(phone_ip, phone_port, auth,
+                                        htonl(entry.orig_dst_ip),
+                                        htons(entry.orig_dst_port), &err, &tm,
+                                        &local_ip);
+        } else {
+            r = ExpSocks5TcpConnect(phone_ip, phone_port, auth,
+                                    htonl(entry.orig_dst_ip),
+                                    htons(entry.orig_dst_port), &err, &tm,
+                                    &local_ip);
+        }
     }
     int dial_ms = static_cast<int>(std::chrono::duration_cast<
         std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
@@ -1882,9 +2225,63 @@ struct ExpEngine::Impl {
         status(L"FAULTED: " + why + L"(disconnect and reconnect)");
     }
 
+    // beta0.4.1: return true if this outbound flow's owning process is on the
+    // anti-cheat direct denylist. Verdict is cached per (proto, local port)
+    // with a short TTL so the OS table is not enumerated on every packet.
+    // Returns true if the flow's owning process is on the ACE/Guard denylist.
+    // Pure name lookup now: the ROUTING decision (relay vs native) is made by
+    // the caller per relay_mode. beta0.4.8.
+    bool IsListedProcess(bool is_tcp, uint32_t src_ip, uint16_t sport,
+                         uint32_t dst_ip, uint16_t dport,
+                         std::wstring* hit_name) {
+        uint16_t sp = ntohs(sport);
+        uint32_t key = (static_cast<uint32_t>(is_tcp ? 1 : 0) << 16) | sp;
+        uint64_t now = GetTickCount64();
+        {
+            std::lock_guard<std::mutex> lk(direct_mtx);
+            auto it = direct_cache.find(key);
+            if (it != direct_cache.end() && it->second.expire_ms > now) {
+                // On a cache hit leave hit_name empty: the caller logs only
+                // on a fresh (first) decision, so one line per process/flow.
+                return it->second.direct;
+            }
+        }
+        // Enumerate outside the cache lock (the OS-table walk can be slow).
+        DWORD pid = is_tcp ? anticheat::PidByTcp(src_ip, sport, dst_ip, dport)
+                           : anticheat::PidByUdp(src_ip, sport);
+        bool direct = anticheat::IsDirectProcess(pid);
+        if (direct) {
+            std::wstring nm = anticheat::ProcessName(pid);
+            if (hit_name) *hit_name = nm.empty() ? L"unknown" : nm;
+        }
+        {
+            std::lock_guard<std::mutex> lk(direct_mtx);
+            // Bound the cache so a long session with many ephemeral ports
+            // cannot grow without limit: prune expired entries occasionally.
+            if (direct_cache.size() > 4096) {
+                for (auto it = direct_cache.begin(); it != direct_cache.end(); )
+                    if (it->second.expire_ms <= now) it = direct_cache.erase(it);
+                    else ++it;
+            }
+            // Positive verdicts are stable (10s). A negative verdict may be a
+            // race — the OS TCP row for a brand-new SYN may not be published
+            // yet — so retry sooner (1.5s, before the typical SYN retransmit).
+            direct_cache[key] = DirectVerdict{direct, now + (direct ? 10000 : 1500)};
+        }
+        return direct;
+    }
+
     ExpAuth auth;
     std::string phone8;
+    uint16_t phone_port_h = 8080;  // host order, for the liveness watchdog probe
     uint32_t phone_net = 0;   // network order, for precise loop avoidance
+
+    // beta0.4.1: anti-cheat direct bypass decision cache. Walking the OS
+    // TCP/UDP table per packet is expensive; cache the verdict per local port
+    // for a short TTL. Key = (protocol<<16 | local_port host order).
+    struct DirectVerdict { bool direct = false; uint64_t expire_ms = 0; };
+    std::mutex direct_mtx;
+    std::unordered_map<uint32_t, DirectVerdict> direct_cache;
 
     // DNS adapter override (set on Start, restored on Stop)
     DnsBackup dns_backup;
@@ -1898,11 +2295,16 @@ struct ExpEngine::Impl {
     DnsProxy dnsproxy;
     std::thread dnsproxy_thr;
 
-    std::thread main_thr, accept_thr, expire_thr;
+    std::thread main_thr, accept_thr, expire_thr, liveness_thr;
+    // beta0.5.0 phone-liveness watchdog state. Only the liveness thread
+    // writes strikes; the atomic flag makes the teardown decision one-shot.
+    std::atomic<int> liveness_strikes{0};
+    std::atomic<bool> phone_lost_reported{false};
 
     void MainLoop();
     void AcceptLoop();
     void ExpireLoop();
+    void LivenessLoop();
     void AuditTcpTakeover();
 };
 
@@ -1984,6 +2386,15 @@ void ExpEngine::Impl::AuditTcpTakeover() {
         const MIB_TCPROW_OWNER_PID& r = tbl->table[i];
         if (r.dwState != MIB_TCP_STATE_ESTAB) continue;
         if (r.dwOwningPid == self) continue;   // our own relay/control sockets
+        // beta0.4.8: native-direct flows intentionally bypass our NAT and are
+        // NOT leaks. Under mode 1 (default) these are the NON-listed processes;
+        // under legacy mode 2 they are the listed ones. Exclude them from the
+        // audit so "unmanaged (expected 0)" stays meaningful.
+        bool listed = anticheat::IsDirectProcess(r.dwOwningPid);
+        bool native_direct = (policy.relay_mode == 1) ? !listed
+                           : (policy.relay_mode == 2) ? listed
+                           : false;  // mode 0: everyone relayed, no exclusion
+        if (native_direct) continue;
         uint32_t remote_net = static_cast<uint32_t>(r.dwRemoteAddr);
         if (IsBypassDst(remote_net)) continue;  // LAN / multicast / loopback
         ++total;
@@ -2177,8 +2588,14 @@ void ExpEngine::Impl::ExpireLoop() {
                     L" proxy endpoint bypass " + std::to_wstring(stats->endpoint_bypass.load()) +
                     L" | blocked " + std::to_wstring(stats->blocked.load()) +
                     L" | DNS state " +
-                    (dns_ready ? L"ready (127.0.0.1:53)"
-                               : L"degraded (WinDivert interception)") +
+                    (!policy.system_dns_proxy
+                         ? L"app-level (system DNS untouched)"
+                         : (dns_ready ? L"legacy (127.0.0.1:53)"
+                                      : L"degraded (WinDivert interception)")) +
+                    L" | anti-cheat direct " +
+                    std::to_wstring(stats->anticheat_direct_flows.load()) +
+                    L" flows/" + std::to_wstring(stats->anticheat_direct_packets.load()) +
+                    L" pkts" +
                     L" | leak " + std::to_wstring(stats->leak.load()) +
                     L" (expected 0) | takeover audit via engine " +
                     std::to_wstring(stats->audit_managed.load()) + L"/" +
@@ -2187,6 +2604,60 @@ void ExpEngine::Impl::ExpireLoop() {
                     L"(expected 0)");
             }
         }
+    }
+}
+
+// beta0.5.0 phone-liveness watchdog.
+//
+// The PC has NO second Internet egress — everything rides the phone. When the
+// phone app is killed, the phone walks out of range, or its cellular uplink
+// drops, WinDivert keeps capturing outbound packets and the SOCKS5 CONNECTs
+// just fail, so the UI stubbornly reads "connected" while nothing gets
+// through and app-closed/CONNECT_REPLY_MISSING flood the log.
+//
+// This watchdog runs on its OWN thread and probes the full phone -> public
+// DNS path regardless of how many TCP flows are active (so it also works when
+// tcp=0, idle). After `probe_strikes` consecutive failures it tears the engine
+// down itself: stop capture, fault the state, and emit a dedicated status
+// token the UI uses to reset to "not connected" WITHOUT auto-reconnecting.
+// A single success resets the strike counter (a transient wobble is tolerated).
+void ExpEngine::Impl::LivenessLoop() {
+    // Give the data plane a moment to come up before the first probe.
+    for (int i = 0; i < 20 && running.load(); ++i) Sleep(100);
+    while (running.load()) {
+        std::string perr;
+        bool ok = ExpSocks5Liveness(phone8,
+                                    static_cast<uint16_t>(phone_port_h), auth,
+                                    &perr);
+        if (ok) {
+            if (liveness_strikes.exchange(0) > 0)
+                log(L"[exp] phone liveness RECOVERED (probe ok)");
+        } else {
+            int strikes = liveness_strikes.fetch_add(1) + 1;
+            log(L"[exp] phone liveness probe failed " +
+                std::to_wstring(strikes) + L"/" +
+                std::to_wstring(policy.probe_strikes) + L": " +
+                FromUtf8(perr));
+            if (strikes >= policy.probe_strikes &&
+                !phone_lost_reported.exchange(true)) {
+                // Tear down from inside the engine. Stop() (called later by
+                // the UI) is idempotent and will join us; we must NOT call it
+                // here or we would join our own thread. Close divert so the
+                // blocked MainLoop recv returns and all loops wind down.
+                log(L"[exp] PHONE LOST - auto-disconnect (no auto-reconnect)");
+                SetFault(L"phone unreachable (app closed / out of range / no signal)");
+                status(L"PHONE_LOST_AUTO_DISCONNECT");
+                running.store(false);
+                if (divert != INVALID_HANDLE_VALUE) {
+                    wd.close(divert);
+                    divert = INVALID_HANDLE_VALUE;
+                }
+                break;
+            }
+        }
+        // Interruptible sleep in 1 s slices so Stop() is always prompt.
+        for (int s = 0; s < policy.probe_interval_s && running.load(); ++s)
+            Sleep(1000);
     }
 }
 
@@ -2263,6 +2734,47 @@ void ExpEngine::Impl::MainLoop() {
         uint16_t dport = tcph ? tcph->DstPort : (udph ? udph->DstPort : 0);
         if (udph) stats->udp_capture.fetch_add(1);
 
+        // ---- beta0.4.9: per-process routing (relay_mode) ----
+        // DNS is handled by its own branch below and MUST stay on the A route
+        // (SOCKS5 TCP DNS) regardless of process — the phone is a proxy, not a
+        // resolver, so native-route DNS would fail. Never B-route UDP:53.
+        //
+        // DEFAULT (mode 0 / A++): this whole block is skipped; EVERY process
+        // — LOL client, browser, ACE/Guard/Vanguard — falls through to the
+        // WinDivert local-reflection -> phone SOCKS5 route below. Equal
+        // treatment is the point: no process gets a distinguishable path,
+        // which is the lowest-fingerprint option for anti-cheat.
+        //
+        // The B route (verbatim native reinjection) is OFF by default because
+        // it has NO Internet on this host. Modes 1/2 are kept ONLY as explicit
+        // opt-in for a machine that really has a native default route.
+        bool is_dns = (udph && ntohs(dport) == 53);
+        if (addr.Outbound && (tcph || udph) && !is_dns &&
+            policy.relay_mode != 0) {
+            std::wstring hit_name;
+            bool listed = IsListedProcess(tcph != nullptr, iph->SrcAddr,
+                                          sport, dst_ip, dport, &hit_name);
+            // mode 1 (opt-in): listed -> A (SOCKS5 relay), others -> B (native)
+            // mode 2 (legacy):  listed -> B (native),    others -> A (SOCKS5)
+            bool go_native = (policy.relay_mode == 1) ? !listed : listed;
+            if (go_native) {
+                stats->anticheat_direct_packets.fetch_add(1);
+                WarnLog(log, L"[exp] NATIVE DIRECT " + hit_name +
+                    L" -> " + IpW(dst_ip) + L":" +
+                    std::to_wstring(ntohs(dport)) +
+                    L" (" + (tcph ? L"TCP" : L"UDP") +
+                    L") bypassing SOCKS5, native route (opt-in mode "
+                    + std::to_wstring(policy.relay_mode) + L")");
+                stats->anticheat_direct_flows.fetch_add(1);
+                WdInject(divert, wd, pkt.data(), len, &addr,
+                         L"native direct (opt-in)", 0, stats, log);
+                continue;
+            }
+            if (listed && !hit_name.empty())
+                WarnLog(log, L"[exp] RELAY " + hit_name +
+                    L" via SOCKS5 (opt-in redirect back to A route)");
+        }
+
         // ---- DNS (UDP:53) BEFORE the underlay exclusion ----
         // beta0.1.8 (report §06): this branch used to sit AFTER the
         // "phone endpoint bypass" test, so a query addressed to the phone's
@@ -2279,6 +2791,46 @@ void ExpEngine::Impl::MainLoop() {
             // must never be referenced after MainLoop moves on
             std::vector<uint8_t> q(static_cast<const uint8_t*>(data),
                                    static_cast<const uint8_t*>(data) + dlen);
+            // beta0.4.1: the app-level DNS path must suppress AAAA just like
+            // the (now default-disabled) loopback proxy did. Without this,
+            // browsers get real AAAA answers for IPv6 we then block, causing
+            // Happy-Eyeballs stalls. Answer NOERROR/0 locally, no phone hop.
+            if (g_aaaa_suppress.load() &&
+                IsAaaaOnlyQuery(q.data(), q.size())) {
+                std::vector<uint8_t> r = MakeEmptyDnsReply(q.data(), q.size());
+                if (!r.empty()) {
+                    // Build the reply datagram sourced from the queried server.
+                    size_t psz = sizeof(WINDIVERT_IPHDR) +
+                                 sizeof(WINDIVERT_UDPHDR) + r.size();
+                    std::vector<uint8_t> rp(psz, 0);
+                    auto* riph = reinterpret_cast<WINDIVERT_IPHDR*>(rp.data());
+                    auto* rudp = reinterpret_cast<WINDIVERT_UDPHDR*>(
+                        rp.data() + sizeof(WINDIVERT_IPHDR));
+                    riph->Version = 4;
+                    riph->HdrLength = sizeof(WINDIVERT_IPHDR) / 4;
+                    riph->Length = htons(static_cast<uint16_t>(psz));
+                    riph->TTL = 64;
+                    riph->Protocol = IPPROTO_UDP;
+                    riph->SrcAddr = dst_ip;          // queried resolver
+                    riph->DstAddr = iph->SrcAddr;    // app
+                    rudp->SrcPort = dport;
+                    rudp->DstPort = sport;
+                    rudp->Length = htons(static_cast<uint16_t>(
+                        sizeof(WINDIVERT_UDPHDR) + r.size()));
+                    std::memcpy(rp.data() + sizeof(WINDIVERT_IPHDR) +
+                                    sizeof(WINDIVERT_UDPHDR), r.data(), r.size());
+                    WINDIVERT_ADDRESS raddr{};
+                    raddr.Outbound = FALSE;
+                    raddr.Loopback = FALSE;
+                    raddr.Network.IfIdx = addr.Network.IfIdx;
+                    raddr.Network.SubIfIdx = addr.Network.SubIfIdx;
+                    wd.checksums(rp.data(), (UINT)psz, &raddr, 0);
+                    WdInject(divert, wd, rp.data(), (UINT)psz, &raddr,
+                             L"AAAA suppress", 0, stats, log);
+                    stats->dns_ok.fetch_add(1);
+                    continue;
+                }
+            }
             // §5.1: if the app's resolver is the phone itself (Wi-Fi Direct
             // DHCP hands out 192.168.49.1), the phone would have to CONNECT
             // to its own :53 and never answers. Send the query to a public
@@ -2695,7 +3247,10 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     // Stop(), so every global is copied out here exactly once.
     g_flow_log.store(I->policy.flow_log);
     g_stats_interval_s.store(I->policy.stats_interval_s);
+    g_fast_handshake.store(I->policy.fast_handshake);
+    g_aaaa_suppress.store(I->policy.aaaa_suppress);
     I->dnsproxy.aaaa_suppress.store(I->policy.aaaa_suppress);
+    anticheat::InitNames();   // beta0.4.1: built-in + file-based direct list
     I->log(L"[exp] policy: UDP443=" +
            std::wstring(I->policy.udp443_drop ? L"drop" : L"proxy") +
            L" IPv6=" +
@@ -2703,13 +3258,24 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
            L" AAAA=" +
            (I->policy.aaaa_suppress ? L"suppress" : L"allow (test)") +
            L" firewall inbound=" +
-           (I->policy.firewall_allow ? L"allow add" : L"detect only"));
+           (I->policy.firewall_allow ? L"allow add" : L"detect only") +
+           L" DNS=" + (I->policy.system_dns_proxy
+                          ? L"legacy(loopback+netsh)"
+                          : L"app-level(WinDivert UDP:53, system DNS untouched)") +
+           L" relay-mode=" + std::to_wstring(I->policy.relay_mode) +
+           L" (" + (I->policy.relay_mode == 1
+                       ? L"OPT-IN: ACE/Guard->SOCKS5, others->native(no net here)"
+                       : I->policy.relay_mode == 2
+                         ? L"OPT-IN legacy: ACE/Guard->native, others->SOCKS5"
+                         : L"A++: all->SOCKS5, equal path") + L")" +
+           L" fast-handshake=" + (I->policy.fast_handshake ? L"on" : L"off"));
     if (I->policy.firewall_allow) {
         std::wstring fw;
         EnsureFirewallInboundRule(&fw);
         I->log(L"[exp] ENGINE_FIREWALL " + fw);
     }
     I->phone8 = ToUtf8(cfg.phone_ip);
+    I->phone_port_h = static_cast<uint16_t>(cfg.phone_port);
     I->auth.user = ToUtf8(cfg.socks_user);
     I->auth.pass = ToUtf8(cfg.socks_pass);
     if (I->phone8.empty() || cfg.phone_port <= 0) {
@@ -2819,7 +3385,19 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     //   2. a failed setup is reported as an explicit DEGRADED state instead
     //      of being silently treated as "will work anyway".
     bool dns_ready = false;
-    if (BackupAdapterDns(I->phone8, &I->dns_backup)) {
+    if (!I->policy.system_dns_proxy) {
+        // beta0.4.1 DEFAULT: the system DNS configuration is NEVER touched.
+        // All name resolution is served by the application-layer path below:
+        // WinDivert captures UDP:53 queries (filter clause at BuildCaptureFilter)
+        // and DnsWorker relays them over SOCKS5 TCP DNS to a public resolver,
+        // synthesising a reply that looks like it came from the queried server.
+        // This avoids netsh/loopback system pollution, needs no DNS restore on
+        // Stop, and leaves NCSI / other apps' resolver settings untouched.
+        dns_ready = true;   // DNS is handled — just not by a system override
+        I->log(L"[exp] DNS app-level ACTIVE: system DNS UNTOUCHED (no netsh, no "
+               L"127.0.0.1 override); UDP:53 intercepted by WinDivert and relayed "
+               L"over SOCKS5 TCP DNS to public resolver");
+    } else if (BackupAdapterDns(I->phone8, &I->dns_backup)) {
         I->dnsproxy.sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (I->dnsproxy.sock != INVALID_SOCKET) {
             // beta0.2.3 root fix: Windows UDP sockets report the ICMP
@@ -2876,6 +3454,11 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
                L"system lookups fall back to WinDivert interception");
     }
     I->dns_ready = dns_ready;
+    {
+        std::lock_guard<std::mutex> lk(g_app_dns_cache.mtx);
+        g_app_dns_cache.map.clear();   // never serve stale answers across reconnects
+    }
+    AppDnsPoolDrain();   // beta0.4.3: drop stale pooled links from any prior session
 
     // --- local TCP listener (reflection target) ---
     I->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -2951,6 +3534,16 @@ bool ExpEngine::Start(const ExpConfig& cfg, std::wstring* error) {
     I->accept_thr = std::thread([I] { I->AcceptLoop(); });
     I->main_thr = std::thread([I] { I->MainLoop(); });
     I->expire_thr = std::thread([I] { I->ExpireLoop(); });
+    // beta0.5.0: reset one-shot watchdog state for this session and start
+    // the phone-liveness thread (no-op if disabled in exp_policy.ini).
+    I->liveness_strikes.store(0);
+    I->phone_lost_reported.store(false);
+    if (I->policy.phone_liveness) {
+        I->liveness_thr = std::thread([I] { I->LivenessLoop(); });
+        I->log(L"[exp] phone-liveness watchdog ARMED interval=" +
+               std::to_wstring(I->policy.probe_interval_s) + L"s strikes=" +
+               std::to_wstring(I->policy.probe_strikes));
+    }
 
     I->log(L"[exp] ENGINE_RUNNING data plane up: WinDivert capture -> local reflection:" +
            std::to_wstring(I->local_port) + L" -> SOCKS5 " + cfg.phone_ip +
@@ -2989,10 +3582,11 @@ void ExpEngine::Stop() {
                 ExpSocks5UdpClose(&kv.second->assoc);
         I->udp.clear();
     }
-    // join the three structural threads
+    // join the structural threads (liveness watchdog included)
     if (I->main_thr.joinable()) I->main_thr.join();
     if (I->accept_thr.joinable()) I->accept_thr.join();
     if (I->expire_thr.joinable()) I->expire_thr.join();
+    if (I->liveness_thr.joinable()) I->liveness_thr.join();
     // detached TCP pumps exit once both of their sockets are closed — close
     // every live session here, then wait for the workers to deregister.
     // CloseOnce is the single owner of the handle: if the worker already
@@ -3025,6 +3619,7 @@ void ExpEngine::Stop() {
         for (SOCKET s : I->dnsproxy.pool) closesocket(s);
         I->dnsproxy.pool.clear();
     }
+    AppDnsPoolDrain();   // beta0.4.3: close app-level DNS pooled links on stop
     // restore the adapter DNS configuration we overrode on Start
     if (I->dns_backup.changed) {
         std::wstring name = L"\"" + I->dns_backup.ifname + L"\"";

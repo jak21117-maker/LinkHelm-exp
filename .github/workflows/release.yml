@@ -101,13 +101,14 @@ jobs:
           Copy-Item build/LinkHelmExp.exe $pkg/
           Copy-Item windivert/WinDivert.dll, windivert/WinDivert64.sys $pkg/
           Copy-Item engine/linkhelm_ics.exe $pkg/engine/
-          Copy-Item CMakeLists.txt, README.md, README_zh.md, sponsor_qr.png, THIRD_PARTY_NOTICES.md, LICENSE, SECURITY.md $pkg/
+          Copy-Item CMakeLists.txt, sponsor_qr.png, THIRD_PARTY_NOTICES.md, LICENSE, SECURITY.md $pkg/
           Copy-Item tests/exp_policy.ini.example $pkg/
           Copy-Item selftest_output.txt $pkg/SELFTEST_RESULT.txt
           Set-Content -Path "$pkg/linkhelm.log" -Value "log file created here on first run" -Encoding ASCII -NoNewline
 
           Copy-Item build/driver_probe.exe, build/socks5_probe.exe $pkg/tests/
           Copy-Item tests/driver_probe.cpp, tests/exp_selftest.cpp, tests/socks5_probe.cpp, `
+                    tests/relay_policy_test.cpp, tests/fast_handshake_probe.cpp, tests/liveness_probe.cpp, `
                     tests/egress_compare.ps1, tests/verify_baseline.ps1 $pkg/tests/
           Copy-Item src/*.cpp, src/*.h $pkg/src/
 

@@ -164,6 +164,24 @@ SOCKET DialWithTimeout(const std::string& phone_ip, uint16_t phone_port,
     return s;
 }
 
+// beta0.4.9 "A++": build the RFC1929 username/password subnegotiation bytes.
+// Factored out of HandshakeAuth so the fast (pipelined) path can coalesce them
+// with the greeting and CONNECT into ONE send.
+static bool BuildUserPassBytes(const ExpAuth& auth, std::vector<uint8_t>* out,
+                               std::string* err) {
+    if (auth.user.empty() || auth.user.size() > 255 ||
+        auth.pass.size() > 255) {
+        if (err) *err = "credentials missing or too long";
+        return false;
+    }
+    out->push_back(0x01);
+    out->push_back(static_cast<uint8_t>(auth.user.size()));
+    out->insert(out->end(), auth.user.begin(), auth.user.end());
+    out->push_back(static_cast<uint8_t>(auth.pass.size()));
+    out->insert(out->end(), auth.pass.begin(), auth.pass.end());
+    return true;
+}
+
 // Greeting (offer no-auth + userpass, prefer no-auth if the server allows it)
 // plus RFC1929 subnegotiation when the server picks 0x02.
 bool HandshakeAuth(SOCKET s, const ExpAuth& auth, std::string* err) {
@@ -188,17 +206,8 @@ bool HandshakeAuth(SOCKET s, const ExpAuth& auth, std::string* err) {
         return false;
     }
     // RFC 1929: ver=1, ulen, uname, plen, passwd
-    if (auth.user.empty() || auth.user.size() > 255 ||
-        auth.pass.size() > 255) {
-        if (err) *err = "credentials missing or too long";
-        return false;
-    }
     std::vector<uint8_t> req;
-    req.push_back(0x01);
-    req.push_back(static_cast<uint8_t>(auth.user.size()));
-    req.insert(req.end(), auth.user.begin(), auth.user.end());
-    req.push_back(static_cast<uint8_t>(auth.pass.size()));
-    req.insert(req.end(), auth.pass.begin(), auth.pass.end());
+    if (!BuildUserPassBytes(auth, &req, err)) return false;
     if (!SendAll(s, req.data(), static_cast<int>(req.size()))) {
         if (err) *err = "auth send failed";
         return false;
@@ -224,6 +233,52 @@ bool ExpSocks5Precheck(const std::string& phone_ip, uint16_t phone_port,
     bool ok = HandshakeAuth(s, auth, err);
     closesocket(s);
     return ok;
+}
+
+bool ExpSocks5Liveness(const std::string& phone_ip, uint16_t phone_port,
+                       const ExpAuth& auth, std::string* err) {
+    // Short dial so a phone that is powered off / out of range fails fast.
+    SOCKET s = DialWithTimeout(phone_ip, phone_port, 3000, err);
+    if (s == INVALID_SOCKET) {
+        if (err) *err = "phone TCP:8080 unreachable - " + *err;
+        return false;
+    }
+    // DialWithTimeout set SO_RCVTIMEO=15000 for data-plane use; the watchdog
+    // must answer quickly, so clamp every handshake stage to a short budget.
+    DWORD tmo = 4000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+
+    if (!HandshakeAuth(s, auth, err)) {
+        if (err) *err = "phone SOCKS5 auth failed - " + *err;
+        closesocket(s);
+        return false;
+    }
+    // Full CONNECT to a public resolver: proves the phone's CELLULAR uplink
+    // still reaches the Internet, not just that its app is listening.
+    // 223.5.5.5:53, IPv4 network-order bytes written explicitly (no cross-TU
+    // helper dependency).
+    uint8_t req[10] = {0x05, 0x01, 0x00, 0x01, 223, 5, 5, 5, 0, 53};
+    if (!SendAll(s, req, sizeof(req))) {
+        if (err) *err = "liveness CONNECT send failed";
+        closesocket(s);
+        return false;
+    }
+    uint8_t head[4];
+    if (!RecvAll(s, head, 4)) {
+        if (err) *err = "liveness CONNECT reply missing (phone uplink down?)";
+        closesocket(s);
+        return false;
+    }
+    closesocket(s);
+    if (head[0] != 0x05 || head[1] != 0x00) {
+        if (err) *err = "liveness CONNECT rejected (REP=0x" +
+                        std::to_string(head[1]) + ")";
+        return false;
+    }
+    return true;
 }
 
 SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
@@ -323,6 +378,149 @@ SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
         timing->tcp_ms = tcp_ms;
         timing->auth_ms = auth_ms;
         timing->connect_ms = stage_ms(t_conn);
+        timing->total_ms = stage_ms(t0);
+    }
+    return s;
+}
+
+// beta0.4.9 "A++" — pipelined SOCKS5 CONNECT.
+//
+// The Android peer (Socks5Parser.kt / ProxyServer.kt) reads a FIXED byte count
+// per stage from ONE blocking InputStream:
+//   readGreeting  : VER(1) NMETHODS(1) METHODS(N)
+//   readUserPass  : VER(1) ULEN(1) UNAME(ULEN) PLEN(1) PASSWD(PLEN)
+//   readRequest   : VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR(4) DST.PORT(2)
+// and flushes each reply independently. TCP is a byte stream, so the client
+// may send all THREE request blocks in one write; the server simply consumes
+// them stage by stage. This collapses greeting + auth + CONNECT from three
+// serial round trips (~3 RTT on the phone's cellular link) into ONE, cutting
+// ~2 RTT (~60-120ms) off every flow's setup — the "shortened reflection arc".
+//
+// Safety: we only pipeline when the peer picks method 0x02 (userpass), which
+// is the only method this server offers (it rejects 0x00 / no-auth). We send
+// greeting advertising ONLY 0x02, so the server's choice is deterministic.
+// If any reply is malformed we fail cleanly; the caller may retry with the
+// serial ExpSocks5TcpConnect via FastHandshake=0.
+SOCKET ExpSocks5TcpConnectFast(const std::string& phone_ip, uint16_t phone_port,
+                               const ExpAuth& auth, uint32_t dst_ip_net,
+                               uint16_t dst_port_net, std::string* err,
+                               ExpSocks5Timing* timing,
+                               uint32_t* local_ip_net) {
+    auto t0 = std::chrono::steady_clock::now();
+    auto stage_ms = [&](std::chrono::steady_clock::time_point since) {
+        return static_cast<int>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - since)
+            .count());
+    };
+    int tcp_ms = 0;
+    SOCKET s = DialWithTimeout(phone_ip, phone_port, 3000, err, &tcp_ms,
+                                local_ip_net);
+    if (s == INVALID_SOCKET) {
+        if (timing) { timing->tcp_ms = tcp_ms; timing->total_ms = tcp_ms; }
+        return INVALID_SOCKET;
+    }
+
+    // Build all three request blocks up front.
+    std::vector<uint8_t> userpass;
+    if (!BuildUserPassBytes(auth, &userpass, err)) {
+        closesocket(s);
+        if (timing) { timing->tcp_ms = tcp_ms; timing->total_ms = stage_ms(t0); }
+        return INVALID_SOCKET;
+    }
+    std::vector<uint8_t> wire;
+    wire.reserve(4 + userpass.size() + 10);
+    // Greeting: VER=5, NMETHODS=1, METHOD=0x02 (userpass only — deterministic).
+    wire.push_back(0x05); wire.push_back(0x01); wire.push_back(0x02);
+    // RFC1929 auth bytes.
+    wire.insert(wire.end(), userpass.begin(), userpass.end());
+    // CONNECT: VER=5 CMD=1 RSV=0 ATYP=1 DST.ADDR DST.PORT.
+    wire.push_back(0x05); wire.push_back(0x01); wire.push_back(0x00);
+    wire.push_back(0x01);
+    const uint8_t ip4[4] = {
+        static_cast<uint8_t>(dst_ip_net & 0xFF),
+        static_cast<uint8_t>((dst_ip_net >> 8) & 0xFF),
+        static_cast<uint8_t>((dst_ip_net >> 16) & 0xFF),
+        static_cast<uint8_t>((dst_ip_net >> 24) & 0xFF)};
+    wire.insert(wire.end(), ip4, ip4 + 4);
+    wire.push_back(static_cast<uint8_t>(dst_port_net & 0xFF));
+    wire.push_back(static_cast<uint8_t>((dst_port_net >> 8) & 0xFF));
+
+    auto t_pipe = std::chrono::steady_clock::now();
+    // ONE write. The phone reads greeting(3B) -> auth(variable) -> request(10B)
+    // in order from its stream buffer.
+    if (!SendAll(s, wire.data(), static_cast<int>(wire.size()))) {
+        if (err) *err = "pipelined handshake send failed";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->total_ms = stage_ms(t0); }
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+
+    // Now consume the three replies in the same order the server emits them.
+    // (1) method selection: VER METHOD
+    uint8_t msel[2];
+    if (!RecvAll(s, msel, 2)) {
+        if (err) *err = "greeting reply missing (pipelined)";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->auth_ms = stage_ms(t_pipe);
+                      timing->total_ms = stage_ms(t0); }
+        closesocket(s); return INVALID_SOCKET;
+    }
+    if (msel[0] != 0x05 || msel[1] != 0x02) {
+        if (err) *err = "server did not select userpass (0x" +
+                        std::to_string(msel[1]) + ")";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->auth_ms = stage_ms(t_pipe);
+                      timing->total_ms = stage_ms(t0); }
+        closesocket(s); return INVALID_SOCKET;
+    }
+    // (2) RFC1929 auth reply: VER STATUS
+    uint8_t ar[2];
+    if (!RecvAll(s, ar, 2)) {
+        if (err) *err = "auth reply missing (pipelined)";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->auth_ms = stage_ms(t_pipe);
+                      timing->total_ms = stage_ms(t0); }
+        closesocket(s); return INVALID_SOCKET;
+    }
+    if (ar[1] != 0x00) {
+        if (err) *err = "username/password rejected by phone";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->auth_ms = stage_ms(t_pipe);
+                      timing->total_ms = stage_ms(t0); }
+        closesocket(s); return INVALID_SOCKET;
+    }
+    int auth_ms = stage_ms(t_pipe);
+    // (3) CONNECT reply: VER REP RSV ATYP + BND.ADDR + BND.PORT
+    uint8_t head[4];
+    if (!RecvAll(s, head, 4)) {
+        if (err) *err = "CONNECT_REPLY_MISSING (pipelined)";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->auth_ms = auth_ms;
+                      timing->connect_ms = stage_ms(t_pipe);
+                      timing->total_ms = stage_ms(t0); }
+        closesocket(s); return INVALID_SOCKET;
+    }
+    if (head[0] != 0x05 || head[1] != 0x00) {
+        if (err) *err = "CONNECT_REJECTED (REP=0x" +
+                        std::to_string(head[1]) + ")";
+        if (timing) { timing->tcp_ms = tcp_ms; timing->auth_ms = auth_ms;
+                      timing->connect_ms = stage_ms(t_pipe);
+                      timing->total_ms = stage_ms(t0); }
+        closesocket(s); return INVALID_SOCKET;
+    }
+    if (head[3] == 0x01) {
+        uint8_t b[6];
+        if (!RecvAll(s, b, 6)) { closesocket(s); return INVALID_SOCKET; }
+    } else if (head[3] == 0x03) {
+        uint8_t len = 0;
+        if (!RecvAll(s, &len, 1)) { closesocket(s); return INVALID_SOCKET; }
+        std::vector<uint8_t> b(len + 2);
+        if (!RecvAll(s, b.data(), len + 2)) { closesocket(s); return INVALID_SOCKET; }
+    } else if (head[3] == 0x04) {
+        uint8_t b[18];
+        if (!RecvAll(s, b, 18)) { closesocket(s); return INVALID_SOCKET; }
+    } else {
+        closesocket(s); return INVALID_SOCKET;
+    }
+    if (timing) {
+        timing->tcp_ms = tcp_ms;
+        timing->auth_ms = auth_ms;
+        timing->connect_ms = stage_ms(t_pipe) - auth_ms;
         timing->total_ms = stage_ms(t0);
     }
     return s;

@@ -14,12 +14,19 @@
 // through unproxied (fail-closed), because on a host with two default routes
 // a passthrough is an unproxied egress that makes the public IP flap.
 //
-// Name resolution is served by an in-process loopback DNS proxy on
-// 127.0.0.1:53: the phone's Wi-Fi Direct DHCP offers its OWN address as the
-// DNS server, but the phone is a SOCKS5 proxy, not a resolver. We repoint
-// the phone adapter's DNS at 127.0.0.1 and relay every query over SOCKS5
-// (TCP DNS, RFC 7766) to a public resolver. Loopback is excluded from the
-// WinDivert filter, so there is no packet-injection race for DNS.
+// Name resolution (beta0.4.1 DEFAULT) is served ENTIRELY at the application
+// layer: WinDivert captures UDP:53 queries and DnsWorker relays each one over
+// SOCKS5 (TCP DNS, RFC 7766) to a public resolver, synthesising the reply so
+// it looks like it came from the originally queried server. NO adapter DNS is
+// changed (no netsh, no 127.0.0.1), so the system resolver configuration is
+// never polluted and needs no restore on Stop. The legacy loopback-proxy +
+// netsh path is retained behind exp_policy.ini SystemDnsProxy=1.
+//
+// beta0.4.1 also passes anti-cheat / protected services (ACE, Vanguard, EAC,
+// BattlEye, TenProtect, ...) straight through on the native route: their
+// packets are matched by owning process name (port -> PID -> name, cached)
+// and reinjected verbatim, never sent to the SOCKS5 plane. Configurable via
+// exp_policy.ini AntiCheatDirect and linkhelm_direct_exes.txt.
 //
 // Interface mirrors the old TunnelManager so the UI wiring stays minimal:
 //   Start(cfg, &err) / Stop().

@@ -26,6 +26,16 @@ struct ExpAuth {
 bool ExpSocks5Precheck(const std::string& phone_ip, uint16_t phone_port,
                        const ExpAuth& auth, std::string* err);
 
+// beta0.5.0 phone-liveness watchdog probe: full SOCKS5 CONNECT to a public
+// resolver (223.5.5.5:53) with a SHORT overall budget — proves both that the
+// phone app is listening (TCP:8080) AND that its cellular uplink actually
+// reaches the Internet. Unlike ExpSocks5Precheck (auth only) this catches
+// "app alive but no signal / out of range / uplink down". Returns true only
+// on a successful CONNECT reply; fills *err with the failing stage otherwise.
+// Intended to be called from a dedicated watchdog thread, never the data plane.
+bool ExpSocks5Liveness(const std::string& phone_ip, uint16_t phone_port,
+                       const ExpAuth& auth, std::string* err);
+
 // Per-stage timing of one SOCKS5 dial. All values in milliseconds.
 // beta0.1.8 (report §04): the field log showed "phone SOCKS5 unreachable
 // (timeout)" at 532ms while the dial budget was 3000ms — the exception set
@@ -51,6 +61,17 @@ SOCKET ExpSocks5TcpConnect(const std::string& phone_ip, uint16_t phone_port,
                            uint16_t dst_port_net, std::string* err,
                            ExpSocks5Timing* timing = nullptr,
                            uint32_t* local_ip_net = nullptr);
+
+// beta0.4.9 "A++" short-reflection handshake: pipeline greeting + RFC1929
+// auth + CONNECT into a single send, collapsing ~3 RTT to ~1 RTT. Protocol-safe
+// because the Android Socks5Parser reads fixed byte counts per stage from one
+// InputStream and the server only accepts method 0x02 (deterministic choice).
+// Fall back to ExpSocks5TcpConnect (FastHandshake=0) if a peer misbehaves.
+SOCKET ExpSocks5TcpConnectFast(const std::string& phone_ip, uint16_t phone_port,
+                               const ExpAuth& auth, uint32_t dst_ip_net,
+                               uint16_t dst_port_net, std::string* err,
+                               ExpSocks5Timing* timing = nullptr,
+                               uint32_t* local_ip_net = nullptr);
 
 struct ExpUdpAssoc {
     SOCKET ctrl = INVALID_SOCKET;   // TCP control connection (owns the assoc)
